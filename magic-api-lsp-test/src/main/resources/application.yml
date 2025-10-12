@@ -1,0 +1,40 @@
+server:
+  port: 8080
+
+spring:
+  datasource:
+    url: jdbc:h2:mem:testdb
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: 
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+
+# Magic API 配置
+magic-api:
+  # 接口存储位置
+  resource:
+    type: database
+    tableName: magic_api_file
+    prefix: /magic-api
+  # 开启 Web 页面
+  web: /magic/web
+  # 开启 LSP 服务
+  lsp:
+    enabled: true
+    port: 8081
+  # 开启调试
+  debug:
+    enabled: true
+    port: 8082
+  # 安全配置
+  security:
+    username: admin
+    password: 123456
+
+logging:
+  level:
+    org.ssssssss.magicapi: DEBUG
+    org.ssssssss.magicapi.lsp: DEBUG

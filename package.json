@@ -1,0 +1,292 @@
+{
+  "name": "magic-api-language-support",
+  "displayName": "Magic API Language Support",
+  "description": "Language support for Magic API with remote server connection, virtual file system, and debugging",
+  "version": "2.0.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/magic-api/magic-api-vscode-extension.git"
+  },
+  "publisher": "magic-api-team",
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Debuggers",
+    "Other"
+  ],
+  "keywords": [
+    "magic-api",
+    "magic-script",
+    "api",
+    "language-server",
+    "debugging",
+    "remote",
+    "virtual-filesystem"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "magic-script",
+        "aliases": [
+          "Magic Script",
+          "magic-script"
+        ],
+        "extensions": [
+          ".ms",
+          ".magic"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+
+    "configuration": {
+      "type": "object",
+      "title": "Magic API",
+      "properties": {
+        "magicApi.servers": {
+          "type": "array",
+          "default": [],
+          "description": "Magic API 服务器配置列表",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "服务器唯一标识"
+              },
+              "name": {
+                "type": "string",
+                "description": "服务器名称"
+              },
+              "url": {
+                "type": "string",
+                "description": "服务器地址"
+              },
+              "username": {
+                "type": "string",
+                "description": "用户名（可选）"
+              },
+              "password": {
+                "type": "string",
+                "description": "密码（可选）"
+              },
+              "token": {
+                "type": "string",
+                "description": "访问令牌（可选）"
+              },
+              "lspPort": {
+                "type": "number",
+                "description": "LSP 服务端口（可选）"
+              },
+              "debugPort": {
+                "type": "number",
+                "description": "调试服务端口（可选）"
+              }
+            }
+          }
+        },
+        "magicApi.currentServer": {
+          "type": "string",
+          "default": null,
+          "description": "当前选中的服务器ID"
+        },
+        "magicApi.autoConnect": {
+          "type": "boolean",
+          "default": true,
+          "description": "启动时自动连接到上次选择的服务器"
+        }
+      }
+    },
+    "breakpoints": [
+      {
+        "language": "magic-script"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "magic-api",
+        "label": "Magic API Debug",
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "serverId": {
+                "type": "string",
+                "description": "Magic API 服务器ID"
+              },
+              "host": {
+                "type": "string",
+                "description": "调试服务器主机地址",
+                "default": "localhost"
+              },
+              "port": {
+                "type": "number",
+                "description": "调试服务器端口",
+                "default": 8081
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "启动后自动停止",
+                "default": true
+              },
+              "trace": {
+                "type": "boolean",
+                "description": "启用调试适配器协议日志",
+                "default": false
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "magic-api",
+            "request": "launch",
+            "name": "调试 Magic API (当前服务器)",
+            "stopOnEntry": true,
+            "trace": false
+          },
+          {
+            "type": "magic-api",
+            "request": "launch",
+            "name": "调试 Magic API (自定义)",
+            "host": "localhost",
+            "port": 8081,
+            "stopOnEntry": true,
+            "trace": false
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "Magic API: 调试当前服务器",
+            "description": "调试当前选择的 Magic API 服务器",
+            "body": {
+              "type": "magic-api",
+              "request": "launch",
+              "name": "调试 Magic API (当前服务器)",
+              "stopOnEntry": true,
+              "trace": false
+            }
+          },
+          {
+            "label": "Magic API: 调试自定义服务器",
+            "description": "调试指定的 Magic API 服务器",
+            "body": {
+              "type": "magic-api",
+              "request": "launch",
+              "name": "调试 Magic API (自定义)",
+              "host": "localhost",
+              "port": 8081,
+              "stopOnEntry": true,
+              "trace": false
+            }
+          }
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "magicApi.selectServer",
+        "title": "选择服务器",
+        "category": "Magic API",
+        "icon": "$(server)"
+      },
+      {
+        "command": "magicApi.addServer",
+        "title": "添加服务器",
+        "category": "Magic API",
+        "icon": "$(add)"
+      },
+      {
+        "command": "magicApi.connectWorkspace",
+        "title": "连接到工作区",
+        "category": "Magic API",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "magicApi.restartLanguageServer",
+        "title": "重启语言服务器",
+        "category": "Magic API",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "magicApi.refreshFileInfo",
+        "title": "刷新文件信息",
+        "category": "Magic API",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "magicApi.createFile",
+        "title": "新建文件",
+        "category": "Magic API",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "magicApi.createGroup",
+        "title": "新建分组",
+        "category": "Magic API",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "magicApi.testApi",
+        "title": "测试 API",
+        "category": "Magic API",
+        "icon": "$(play)"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "magicApi.createFile",
+          "when": "resourceScheme == magic-api",
+          "group": "navigation@1"
+        },
+        {
+          "command": "magicApi.createGroup",
+          "when": "resourceScheme == magic-api",
+          "group": "navigation@2"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "magicApi.testApi",
+          "when": "resourceScheme == magic-api && resourceExtname == .ms",
+          "group": "navigation@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "magicApi.createFile",
+          "when": "false"
+        },
+        {
+          "command": "magicApi.createGroup",
+          "when": "false"
+        }
+      ]
+    }
+  },
+  "activationEvents": [
+    "onLanguage:magic-script",
+    "onFileSystem:magic-api"
+  ],
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "16.x",
+    "@types/vscode": "^1.74.0",
+    "@types/ws": "^8.5.0",
+    "typescript": "^4.9.4"
+  },
+  "dependencies": {
+    "@types/axios": "^0.9.36",
+    "axios": "^1.12.2",
+    "vscode-debugadapter": "^1.51.0",
+    "vscode-languageclient": "^8.1.0",
+    "ws": "^8.14.0"
+  }
+}
