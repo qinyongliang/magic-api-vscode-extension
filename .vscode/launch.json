@@ -15,6 +15,16 @@
             "preLaunchTask": "npm: compile",
             "request": "launch",
             "type": "extensionHost"
+        },
+        {
+            "type": "java",
+            "name": "Spring Boot-MagicApiLspTestApplication<magic-api-lsp-test>",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "mainClass": "com.example.magicapi.MagicApiLspTestApplication",
+            "projectName": "magic-api-lsp-test",
+            "args": "",
+            "envFile": "${workspaceFolder}/.env"
         }
     ]
 }

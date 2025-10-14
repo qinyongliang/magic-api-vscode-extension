@@ -99,10 +99,6 @@ class ServerManager {
     async addServer(server) {
         // 验证服务器连接
         const client = new magicApiClient_1.MagicApiClient(server);
-        const isConnected = await client.testConnection();
-        if (!isConnected) {
-            throw new Error(`无法连接到服务器 ${server.url}`);
-        }
         this.servers.set(server.id, server);
         this.clients.set(server.id, client);
         await this.saveServers();
@@ -114,10 +110,6 @@ class ServerManager {
         }
         // 验证服务器连接
         const client = new magicApiClient_1.MagicApiClient(server);
-        const isConnected = await client.testConnection();
-        if (!isConnected) {
-            throw new Error(`无法连接到服务器 ${server.url}`);
-        }
         this.servers.set(server.id, server);
         this.clients.set(server.id, client);
         await this.saveServers();
@@ -139,14 +131,6 @@ class ServerManager {
             this._onServerChanged.fire(null);
         }
         await this.saveServers();
-    }
-    // 测试服务器连接
-    async testServer(serverId) {
-        const client = this.clients.get(serverId);
-        if (!client) {
-            return false;
-        }
-        return await client.testConnection();
     }
     // 显示服务器选择器
     async showServerPicker() {

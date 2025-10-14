@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { MagicApiClient } from './magicApiClient';
+import { MagicResourceType, MAGIC_RESOURCE_TYPES, isMagicResourceType } from './types';
 
 export interface MagicFileInfo {
     id: string;
@@ -8,7 +9,7 @@ export interface MagicFileInfo {
     script: string;
     groupId: string;
     groupPath: string;
-    type: 'api' | 'function' | 'datasource';
+    type: MagicResourceType;
     createTime?: number;
     updateTime?: number;
     createBy?: string;
@@ -24,7 +25,7 @@ export interface MagicGroupInfo {
     name: string;
     path: string;
     parentId?: string;
-    type: 'api' | 'function' | 'datasource';
+    type: MagicResourceType;
     createTime?: number;
     updateTime?: number;
 }
@@ -105,10 +106,10 @@ export class MagicFileSystemProvider implements vscode.FileSystemProvider {
         const entries: [string, vscode.FileType][] = [];
 
         if (path.isRoot) {
-            // 根目录显示三个类型文件夹
-            entries.push(['api', vscode.FileType.Directory]);
-            entries.push(['function', vscode.FileType.Directory]);
-            entries.push(['datasource', vscode.FileType.Directory]);
+            // 根目录显示所有资源类型文件夹
+            for (const t of MAGIC_RESOURCE_TYPES) {
+                entries.push([t, vscode.FileType.Directory]);
+            }
             return entries;
         }
 
@@ -273,7 +274,7 @@ export class MagicFileSystemProvider implements vscode.FileSystemProvider {
     private parsePath(uri: vscode.Uri): {
         isRoot: boolean;
         isTypeRoot: boolean;
-        type?: 'api' | 'function' | 'datasource';
+        type?: MagicResourceType;
         groupId?: string;
         fileId?: string;
         groupPath?: string[];
@@ -284,10 +285,11 @@ export class MagicFileSystemProvider implements vscode.FileSystemProvider {
             return { isRoot: true, isTypeRoot: false };
         }
 
-        const type = pathParts[0] as 'api' | 'function' | 'datasource';
-        if (!['api', 'function', 'datasource'].includes(type)) {
+        const maybeType = pathParts[0];
+        if (!isMagicResourceType(maybeType)) {
             return { isRoot: false, isTypeRoot: false };
         }
+        const type = maybeType as MagicResourceType;
 
         if (pathParts.length === 1) {
             return { isRoot: false, isTypeRoot: true, type };

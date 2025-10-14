@@ -46,6 +46,11 @@
       "type": "object",
       "title": "Magic API",
       "properties": {
+        "magicApi.webPrefix": {
+          "type": "string",
+          "default": "",
+          "description": "管理页与接口前缀"
+        },
         "magicApi.servers": {
           "type": "array",
           "default": [],

@@ -27,11 +27,13 @@ exports.deactivate = exports.activate = void 0;
 const vscode = __importStar(require("vscode"));
 const serverManager_1 = require("./serverManager");
 const magicFileSystemProvider_1 = require("./magicFileSystemProvider");
+const logger_1 = require("./logger");
 const statusBarManager_1 = require("./statusBarManager");
 const remoteLspClient_1 = require("./remoteLspClient");
 const debugAdapterFactory_1 = require("./debugAdapterFactory");
 function activate(context) {
     console.log('Magic API extension is now active!');
+    (0, logger_1.info)('Magic API extension activated');
     // 初始化管理器
     const serverManager = serverManager_1.ServerManager.getInstance();
     const statusBarManager = statusBarManager_1.StatusBarManager.getInstance();

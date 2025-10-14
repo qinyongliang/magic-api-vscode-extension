@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { MagicApiClient, MagicServerConfig } from './magicApiClient';
+import { debug } from './logger';
 
 export class ServerManager {
     private static instance: ServerManager;
@@ -92,12 +93,6 @@ export class ServerManager {
     async addServer(server: MagicServerConfig): Promise<void> {
         // 验证服务器连接
         const client = new MagicApiClient(server);
-        const isConnected = await client.testConnection();
-        
-        if (!isConnected) {
-            throw new Error(`无法连接到服务器 ${server.url}`);
-        }
-
         this.servers.set(server.id, server);
         this.clients.set(server.id, client);
         await this.saveServers();
@@ -111,12 +106,6 @@ export class ServerManager {
 
         // 验证服务器连接
         const client = new MagicApiClient(server);
-        const isConnected = await client.testConnection();
-        
-        if (!isConnected) {
-            throw new Error(`无法连接到服务器 ${server.url}`);
-        }
-
         this.servers.set(server.id, server);
         this.clients.set(server.id, client);
         await this.saveServers();
@@ -144,17 +133,6 @@ export class ServerManager {
 
         await this.saveServers();
     }
-
-    // 测试服务器连接
-    async testServer(serverId: string): Promise<boolean> {
-        const client = this.clients.get(serverId);
-        if (!client) {
-            return false;
-        }
-
-        return await client.testConnection();
-    }
-
     // 显示服务器选择器
     async showServerPicker(): Promise<string | null> {
         const servers = this.getServers();

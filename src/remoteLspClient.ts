@@ -50,7 +50,7 @@ export class RemoteLspClient {
             // 解析 LSP 服务器地址
             const url = new URL(lspUrl);
             const host = url.hostname;
-            const port = parseInt(url.port) || 8080;
+            const port = parseInt(url.port) || 8081;
 
             // 创建服务器选项
             const serverOptions: ServerOptions = () => {

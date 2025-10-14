@@ -25,6 +25,7 @@ var __importStar = (this && this.__importStar) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.MagicFileSystemProvider = void 0;
 const vscode = __importStar(require("vscode"));
+const types_1 = require("./types");
 class MagicFileSystemProvider {
     constructor(client) {
         this.client = client;
@@ -89,10 +90,10 @@ class MagicFileSystemProvider {
         const path = this.parsePath(uri);
         const entries = [];
         if (path.isRoot) {
-            // 根目录显示三个类型文件夹
-            entries.push(['api', vscode.FileType.Directory]);
-            entries.push(['function', vscode.FileType.Directory]);
-            entries.push(['datasource', vscode.FileType.Directory]);
+            // 根目录显示所有资源类型文件夹
+            for (const t of types_1.MAGIC_RESOURCE_TYPES) {
+                entries.push([t, vscode.FileType.Directory]);
+            }
             return entries;
         }
         if (path.isTypeRoot) {
@@ -232,10 +233,11 @@ class MagicFileSystemProvider {
         if (pathParts.length === 0) {
             return { isRoot: true, isTypeRoot: false };
         }
-        const type = pathParts[0];
-        if (!['api', 'function', 'datasource'].includes(type)) {
+        const maybeType = pathParts[0];
+        if (!(0, types_1.isMagicResourceType)(maybeType)) {
             return { isRoot: false, isTypeRoot: false };
         }
+        const type = maybeType;
         if (pathParts.length === 1) {
             return { isRoot: false, isTypeRoot: true, type };
         }

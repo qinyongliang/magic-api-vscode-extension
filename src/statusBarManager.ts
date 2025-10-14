@@ -81,7 +81,6 @@ export class StatusBarManager {
         }
 
         const fileName = pathParts[pathParts.length - 1].replace('.ms', '');
-        const type = pathParts[0] as 'api' | 'function' | 'datasource';
         
         // 这里需要通过客户端查找文件
         // 实际实现中可能需要更复杂的路径解析逻辑

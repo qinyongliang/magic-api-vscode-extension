@@ -1,12 +1,14 @@
 import * as vscode from 'vscode';
 import { ServerManager } from './serverManager';
 import { MagicFileSystemProvider } from './magicFileSystemProvider';
+import { info } from './logger';
 import { StatusBarManager } from './statusBarManager';
 import { RemoteLspClient } from './remoteLspClient';
 import { MagicApiDebugAdapterDescriptorFactory } from './debugAdapterFactory';
 
 export function activate(context: vscode.ExtensionContext) {
 	console.log('Magic API extension is now active!');
+    info('Magic API extension activated');
 
 	// 初始化管理器
 	const serverManager = ServerManager.getInstance();
