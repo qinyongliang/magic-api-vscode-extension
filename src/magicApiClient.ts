@@ -301,19 +301,55 @@ export class MagicApiClient {
 
     // 获取 LSP 服务器地址
     getLspServerUrl(): string {
-        const port = this.config.lspPort || 8081;
-        const url = new URL(this.config.url);
-        const wsUrl = `ws://${url.hostname}:${port}/magic/lsp`;
-        debug(`LSP URL computed: ${wsUrl}`);
+        const base = new URL(this.config.url);
+        const wsProto = base.protocol === 'https:' ? 'wss' : 'ws';
+        // 端口优先使用 lspPort，其次使用 URL 中的端口，最后回退到 8081
+        const port = this.config.lspPort ?? (base.port ? Number(base.port) : 8081);
+        const hostPort = `${base.hostname}:${port}`;
+        // 路径前缀合并：同时考虑 URL 的 context-path 与 webPrefix，避免重复
+        const basePath = (base.pathname || '').replace(/\/$/, '');
+        const cfgPrefix = (this.webPrefix || '').replace(/\/$/, '');
+        let prefix = '';
+        if (basePath && cfgPrefix) {
+            if (cfgPrefix.startsWith(basePath)) {
+                prefix = cfgPrefix; // 例如 basePath=/app, cfgPrefix=/app/magic/web → 使用 cfgPrefix
+            } else if (basePath.startsWith(cfgPrefix)) {
+                prefix = basePath;
+            } else {
+                prefix = `${basePath}${cfgPrefix}`; // 合并 /app + /magic/web → /app/magic/web
+            }
+        } else {
+            prefix = basePath || cfgPrefix || '';
+        }
+        const wsUrl = `${wsProto}://${hostPort}${prefix}/lsp`;
+        debug(`LSP URL computed: ${wsUrl} (host=${base.hostname}, port=${port}, basePath=${basePath || '/'}, cfgPrefix=${cfgPrefix || ''})`);
         return wsUrl;
     }
 
     // 获取调试服务器地址
     getDebugServerUrl(): string {
-        const port = this.config.debugPort || 8082;
-        const url = new URL(this.config.url);
-        const dbg = `${url.hostname}:${port}`;
-        debug(`Debug URL computed: ${dbg}`);
-        return dbg;
+        const base = new URL(this.config.url);
+        const wsProto = base.protocol === 'https:' ? 'wss' : 'ws';
+        // 端口优先使用 debugPort，其次使用 URL 中的端口，最后回退到 8082
+        const port = this.config.debugPort ?? (base.port ? Number(base.port) : 8082);
+        const hostPort = `${base.hostname}:${port}`;
+        // 路径前缀合并逻辑同上
+        const basePath = (base.pathname || '').replace(/\/$/, '');
+        const cfgPrefix = (this.webPrefix || '').replace(/\/$/, '');
+        let prefix = '';
+        if (basePath && cfgPrefix) {
+            if (cfgPrefix.startsWith(basePath)) {
+                prefix = cfgPrefix;
+            } else if (basePath.startsWith(cfgPrefix)) {
+                prefix = basePath;
+            } else {
+                prefix = `${basePath}${cfgPrefix}`;
+            }
+        } else {
+            prefix = basePath || cfgPrefix || '';
+        }
+        const wsUrl = `${wsProto}://${hostPort}${prefix}/debug`;
+        debug(`Debug WS URL computed: ${wsUrl} (host=${base.hostname}, port=${port}, basePath=${basePath || '/'}, cfgPrefix=${cfgPrefix || ''})`);
+        return wsUrl;
     }
 }

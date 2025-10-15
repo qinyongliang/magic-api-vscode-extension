@@ -5,7 +5,9 @@ import {
 	Thread, StackFrame, Scope, Variable, Breakpoint
 } from 'vscode-debugadapter';
 import { DebugProtocol } from 'vscode-debugprotocol';
-import * as net from 'net';
+import WebSocket from 'ws';
+import { MessageConnection, createMessageConnection } from 'vscode-jsonrpc';
+import { WebSocketMessageReader, WebSocketMessageWriter } from 'vscode-ws-jsonrpc/cjs';
 import { ServerManager } from './serverManager';
 
 interface LaunchRequestArguments extends DebugProtocol.LaunchRequestArguments {
@@ -23,8 +25,10 @@ export class MagicApiDebugSession extends DebugSession {
         this._configurationDoneResolve = resolve;
     });
     private _configurationDoneResolve!: () => void;
-    private _debuggerSocket?: net.Socket;
+    private _ws?: WebSocket;
+    private _connection?: MessageConnection;
     private _isConnected = false;
+    private _initializedSent = false;
 
     public constructor() {
         super();
@@ -70,122 +74,146 @@ export class MagicApiDebugSession extends DebugSession {
         this._configurationDoneResolve();
     }
 
-    protected launchRequest(response: DebugProtocol.LaunchResponse, args: LaunchRequestArguments): void {
-        // 获取连接参数
-        let host = 'localhost';
-        let port = 8081;
-
-        if (args.serverId) {
-            // 使用指定的服务器
-            const serverManager = ServerManager.getInstance();
-            const server = serverManager.getServers().find(s => s.id === args.serverId);
-            const client = serverManager.getCurrentClient();
-            
-            if (server && client) {
-                const debugUrl = client.getDebugServerUrl();
-                const parts = debugUrl.split(':');
-                host = parts[0];
-                port = parseInt(parts[1]) || 8081;
+    protected async launchRequest(response: DebugProtocol.LaunchResponse, args: LaunchRequestArguments): Promise<void> {
+        try {
+            let debugUrl: string | null = null;
+            if (args.serverId) {
+                const serverManager = ServerManager.getInstance();
+                const server = serverManager.getServers().find(s => s.id === args.serverId);
+                const client = serverManager.getCurrentClient();
+                if (server && client) {
+                    debugUrl = await serverManager.getDebugUrl(server.id);
+                    if (!debugUrl) {
+                        this.sendErrorResponse(response, 1001, `无法获取调试服务器地址`);
+                        return;
+                    }
+                } else {
+                    this.sendErrorResponse(response, 1001, `服务器 ${args.serverId} 不存在或未连接`);
+                    return;
+                }
+            } else if (args.host && args.port) {
+                // 按 host/port 组装 WS 地址（默认 ws 协议）
+                debugUrl = `ws://${args.host}:${args.port}/magic/debug`;
             } else {
-                this.sendErrorResponse(response, 1001, `服务器 ${args.serverId} 不存在或未连接`);
+                const serverManager = ServerManager.getInstance();
+                const current = serverManager.getCurrentServer();
+                if (!current) {
+                    this.sendErrorResponse(response, 1001, `请先选择 Magic API 服务器`);
+                    return;
+                }
+                debugUrl = await serverManager.getDebugUrl(current.id);
+            }
+
+            if (!debugUrl) {
+                this.sendErrorResponse(response, 1001, `未能确定调试服务器地址`);
                 return;
             }
-        } else if (args.host && args.port) {
-            // 使用指定的主机和端口
-            host = args.host;
-            port = args.port;
-        } else if (args.port) {
-            // 使用指定的端口，默认主机
-            port = args.port;
-        }
 
-        // 连接到调试服务器
-        this._debuggerSocket = new net.Socket();
-        this._debuggerSocket.connect(port, host, () => {
-            this.sendResponse(response);
-            this.sendEvent(new InitializedEvent());
-        });
+            // 建立 WebSocket 连接并创建 JSON-RPC 通道
+            this._ws = new WebSocket(debugUrl, { perMessageDeflate: false });
 
-        this._debuggerSocket.on('data', (data) => {
-            // 处理从调试服务器接收到的数据
-            this.handleDebugServerMessage(data.toString());
-        });
+            this._ws.on('open', async () => {
+                const socket = {
+                    send: (content: string) => this._ws?.send(content),
+                    onMessage: (cb: (data: any) => void) => this._ws?.on('message', (data: any) => cb(typeof data === 'string' ? data : data?.toString?.() ?? '')),
+                    onError: (cb: (reason: any) => void) => this._ws?.on('error', (err: any) => cb(err)),
+                    onClose: (cb: (code: number, reason: string) => void) => this._ws?.on('close', (code: number, reason: any) => cb(code, typeof reason === 'string' ? reason : reason?.toString?.() ?? '')),
+                    dispose: () => this._ws?.close()
+                };
 
-        this._debuggerSocket.on('error', (err) => {
-            this.sendEvent(new OutputEvent(`调试连接错误 (${host}:${port}): ${err.message}\n`));
-            this.sendErrorResponse(response, 1002, `无法连接到调试服务器: ${err.message}`);
-        });
+                const reader = new WebSocketMessageReader(socket);
+                const writer = new WebSocketMessageWriter(socket);
+                this._connection = createMessageConnection(reader, writer);
 
-        this._debuggerSocket.on('close', () => {
-            this.sendEvent(new TerminatedEvent());
-        });
-    }
+                // 远端事件转发到 VS Code
+                this._connection.onNotification('initialized', () => {
+                    if (!this._initializedSent) {
+                        this.sendEvent(new InitializedEvent());
+                        this._initializedSent = true;
+                    }
+                });
+                this._connection.onNotification('stopped', (evt: any) => {
+                    this.sendEvent(new StoppedEvent(evt?.reason || 'breakpoint', MagicApiDebugSession.THREAD_ID));
+                });
+                this._connection.onNotification('output', (evt: any) => {
+                    const category = typeof evt?.category === 'string' ? evt.category : undefined;
+                    const output = typeof evt?.output === 'string' ? evt.output : JSON.stringify(evt);
+                    this.sendEvent(new OutputEvent(output, category));
+                });
+                this._connection.onNotification('terminated', () => {
+                    this.sendEvent(new TerminatedEvent());
+                });
 
-    private async connectToDebugServer(): Promise<void> {
-        return new Promise((resolve, reject) => {
-            const config = vscode.workspace.getConfiguration('magicApi');
-            const port = config.get('debug.port', 9999) as number;
+                this._connection.onClose(() => {
+                    this._isConnected = false;
+                    this.sendEvent(new TerminatedEvent());
+                });
 
-            this._debuggerSocket = new net.Socket();
-            
-            this._debuggerSocket.connect(port, 'localhost', () => {
+                this._connection.listen();
                 this._isConnected = true;
-                this.sendEvent(new OutputEvent(`Connected to Magic API Debug Server on port ${port}\\n`));
-                resolve();
+
+                // 进行远端初始化
+                try {
+                    await this._connection.sendRequest('initialize', {
+                        adapterID: 'magic-api',
+                        linesStartAt1: false,
+                        columnsStartAt1: false,
+                        pathFormat: 'path'
+                    });
+                } catch (e) {
+                    this.sendEvent(new OutputEvent(`远端初始化失败: ${e}\n`));
+                }
+
+                // 发送远端 launch（将 launch 参数透传，便于服务端使用）
+                try {
+                    await this._connection.sendRequest('launch', args);
+                } catch (e) {
+                    this.sendEvent(new OutputEvent(`远端启动失败: ${e}\n`));
+                }
+
+                this.sendResponse(response);
+                // 如果远端未发送 initialized，则本地触发一次，避免 VS Code 阻塞
+                if (!this._initializedSent) {
+                    this.sendEvent(new InitializedEvent());
+                    this._initializedSent = true;
+                }
             });
 
-            this._debuggerSocket.on('error', (err) => {
-                this.sendEvent(new OutputEvent(`Failed to connect to debug server: ${err.message}\\n`));
-                reject(err);
+            this._ws.on('error', (err) => {
+                this.sendEvent(new OutputEvent(`调试连接错误 (${debugUrl}): ${err.message}\n`));
+                this.sendErrorResponse(response, 1002, `无法连接到调试服务器: ${err.message}`);
             });
 
-            this._debuggerSocket.on('data', (data) => {
-                // Handle debug protocol messages from server
-                this.handleDebugServerMessage(data.toString());
-            });
-
-            this._debuggerSocket.on('close', () => {
+            this._ws.on('close', () => {
                 this._isConnected = false;
                 this.sendEvent(new TerminatedEvent());
             });
-        });
-    }
-
-    private handleDebugServerMessage(message: string): void {
-        try {
-            const data = JSON.parse(message);
-            
-            switch (data.type) {
-                case 'stopped':
-                    this.sendEvent(new StoppedEvent(data.reason || 'breakpoint', MagicApiDebugSession.THREAD_ID));
-                    break;
-                case 'output':
-                    this.sendEvent(new OutputEvent(data.output));
-                    break;
-                case 'terminated':
-                    this.sendEvent(new TerminatedEvent());
-                    break;
-            }
-        } catch (error) {
-            this.sendEvent(new OutputEvent(`Debug protocol error: ${error}\\n`));
+        } catch (e) {
+            this.sendErrorResponse(response, 1002, `启动调试失败: ${e}`);
         }
     }
 
-    protected setBreakPointsRequest(response: DebugProtocol.SetBreakpointsResponse, args: DebugProtocol.SetBreakpointsArguments): void {
-        const path = args.source.path as string;
-        const clientLines = args.lines || [];
+    // 旧的 TCP 连接与桥接消息处理逻辑已移除，改为 JSON-RPC over WebSocket
 
-        // Set breakpoints
-        const actualBreakpoints = clientLines.map(line => {
-            const bp = new Breakpoint(true, line) as DebugProtocol.Breakpoint;
-            bp.id = this.generateBreakpointId();
-            return bp;
-        });
-
-        response.body = {
-            breakpoints: actualBreakpoints
-        };
-
+    protected async setBreakPointsRequest(response: DebugProtocol.SetBreakpointsResponse, args: DebugProtocol.SetBreakpointsArguments): Promise<void> {
+        if (this._connection && this._isConnected) {
+            try {
+                const remote = await this._connection.sendRequest('setBreakpoints', args);
+                response.body = remote as any;
+            } catch (e) {
+                this.sendEvent(new OutputEvent(`设置断点失败: ${e}\n`));
+                response.body = { breakpoints: [] } as any;
+            }
+        } else {
+            // 本地回退：直接标记为可验证断点
+            const clientLines = args.lines || [];
+            const actualBreakpoints = clientLines.map(line => {
+                const bp = new Breakpoint(true, line) as DebugProtocol.Breakpoint;
+                bp.id = this.generateBreakpointId();
+                return bp;
+            });
+            response.body = { breakpoints: actualBreakpoints } as any;
+        }
         this.sendResponse(response);
     }
 
@@ -193,94 +221,119 @@ export class MagicApiDebugSession extends DebugSession {
         return Math.floor(Math.random() * 1000000);
     }
 
-    protected threadsRequest(response: DebugProtocol.ThreadsResponse): void {
-        response.body = {
-            threads: [
-                new Thread(MagicApiDebugSession.THREAD_ID, 'Magic API Main Thread')
-            ]
-        };
-        this.sendResponse(response);
-    }
-
-    protected stackTraceRequest(response: DebugProtocol.StackTraceResponse, args: DebugProtocol.StackTraceArguments): void {
-        const frames: StackFrame[] = [
-            new StackFrame(0, 'main', undefined, 1, 1)
-        ];
-
-        response.body = {
-            stackFrames: frames,
-            totalFrames: frames.length
-        };
-        this.sendResponse(response);
-    }
-
-    protected scopesRequest(response: DebugProtocol.ScopesResponse, args: DebugProtocol.ScopesArguments): void {
-        response.body = {
-            scopes: [
-                new Scope('Local', 1000, false),
-                new Scope('Global', 1001, true)
-            ]
-        };
-        this.sendResponse(response);
-    }
-
-    protected variablesRequest(response: DebugProtocol.VariablesResponse, args: DebugProtocol.VariablesArguments): void {
-        const variables: Variable[] = [];
-
-        if (args.variablesReference === 1000) {
-            // Local variables
-            variables.push(new Variable('localVar', 'local value'));
-        } else if (args.variablesReference === 1001) {
-            // Global variables
-            variables.push(new Variable('globalVar', 'global value'));
-        }
-
-        response.body = {
-            variables: variables
-        };
-        this.sendResponse(response);
-    }
-
-    protected continueRequest(response: DebugProtocol.ContinueResponse, args: DebugProtocol.ContinueArguments): void {
-        if (this._isConnected && this._debuggerSocket) {
-            this._debuggerSocket.write(JSON.stringify({ command: 'continue' }));
+    protected async threadsRequest(response: DebugProtocol.ThreadsResponse): Promise<void> {
+        if (this._connection && this._isConnected) {
+            try {
+                const remote = await this._connection.sendRequest('threads');
+                response.body = remote as any;
+            } catch (e) {
+                this.sendEvent(new OutputEvent(`获取线程失败: ${e}\n`));
+                response.body = { threads: [ new Thread(MagicApiDebugSession.THREAD_ID, 'Magic API Main Thread') ] } as any;
+            }
+        } else {
+            response.body = { threads: [ new Thread(MagicApiDebugSession.THREAD_ID, 'Magic API Main Thread') ] } as any;
         }
         this.sendResponse(response);
     }
 
-    protected nextRequest(response: DebugProtocol.NextResponse, args: DebugProtocol.NextArguments): void {
-        if (this._isConnected && this._debuggerSocket) {
-            this._debuggerSocket.write(JSON.stringify({ command: 'next' }));
+    protected async stackTraceRequest(response: DebugProtocol.StackTraceResponse, args: DebugProtocol.StackTraceArguments): Promise<void> {
+        if (this._connection && this._isConnected) {
+            try {
+                const remote = await this._connection.sendRequest('stackTrace', args);
+                response.body = remote as any;
+            } catch (e) {
+                this.sendEvent(new OutputEvent(`获取堆栈失败: ${e}\n`));
+                response.body = { stackFrames: [], totalFrames: 0 } as any;
+            }
+        } else {
+            response.body = { stackFrames: [], totalFrames: 0 } as any;
         }
         this.sendResponse(response);
     }
 
-    protected stepInRequest(response: DebugProtocol.StepInResponse, args: DebugProtocol.StepInArguments): void {
-        if (this._isConnected && this._debuggerSocket) {
-            this._debuggerSocket.write(JSON.stringify({ command: 'stepIn' }));
+    protected async scopesRequest(response: DebugProtocol.ScopesResponse, args: DebugProtocol.ScopesArguments): Promise<void> {
+        if (this._connection && this._isConnected) {
+            try {
+                const remote = await this._connection.sendRequest('scopes', args);
+                response.body = remote as any;
+            } catch (e) {
+                this.sendEvent(new OutputEvent(`获取变量作用域失败: ${e}\n`));
+                response.body = { scopes: [] } as any;
+            }
+        } else {
+            response.body = { scopes: [] } as any;
         }
         this.sendResponse(response);
     }
 
-    protected stepOutRequest(response: DebugProtocol.StepOutResponse, args: DebugProtocol.StepOutArguments): void {
-        if (this._isConnected && this._debuggerSocket) {
-            this._debuggerSocket.write(JSON.stringify({ command: 'stepOut' }));
+    protected async variablesRequest(response: DebugProtocol.VariablesResponse, args: DebugProtocol.VariablesArguments): Promise<void> {
+        if (this._connection && this._isConnected) {
+            try {
+                const remote = await this._connection.sendRequest('variables', args);
+                response.body = remote as any;
+            } catch (e) {
+                this.sendEvent(new OutputEvent(`获取变量失败: ${e}\n`));
+                response.body = { variables: [] } as any;
+            }
+        } else {
+            response.body = { variables: [] } as any;
         }
         this.sendResponse(response);
     }
 
-    protected evaluateRequest(response: DebugProtocol.EvaluateResponse, args: DebugProtocol.EvaluateArguments): void {
-        response.body = {
-            result: `Evaluation result for: ${args.expression}`,
-            variablesReference: 0
-        };
+    protected async continueRequest(response: DebugProtocol.ContinueResponse, args: DebugProtocol.ContinueArguments): Promise<void> {
+        if (this._connection && this._isConnected) {
+            try { await this._connection.sendRequest('continue', args); } catch {}
+        }
         this.sendResponse(response);
     }
 
-    protected disconnectRequest(response: DebugProtocol.DisconnectResponse, args: DebugProtocol.DisconnectArguments): void {
-        if (this._debuggerSocket) {
-            this._debuggerSocket.destroy();
+    protected async nextRequest(response: DebugProtocol.NextResponse, args: DebugProtocol.NextArguments): Promise<void> {
+        if (this._connection && this._isConnected) {
+            try { await this._connection.sendRequest('next', args); } catch {}
         }
         this.sendResponse(response);
+    }
+
+    protected async stepInRequest(response: DebugProtocol.StepInResponse, args: DebugProtocol.StepInArguments): Promise<void> {
+        if (this._connection && this._isConnected) {
+            try { await this._connection.sendRequest('stepIn', args); } catch {}
+        }
+        this.sendResponse(response);
+    }
+
+    protected async stepOutRequest(response: DebugProtocol.StepOutResponse, args: DebugProtocol.StepOutArguments): Promise<void> {
+        if (this._connection && this._isConnected) {
+            try { await this._connection.sendRequest('stepOut', args); } catch {}
+        }
+        this.sendResponse(response);
+    }
+
+    protected async evaluateRequest(response: DebugProtocol.EvaluateResponse, args: DebugProtocol.EvaluateArguments): Promise<void> {
+        if (this._connection && this._isConnected) {
+            try {
+                const remote = await this._connection.sendRequest('evaluate', args);
+                response.body = remote as any;
+            } catch (e) {
+                this.sendEvent(new OutputEvent(`表达式求值失败: ${e}\n`));
+                response.body = { result: '', variablesReference: 0 } as any;
+            }
+        } else {
+            response.body = { result: '', variablesReference: 0 } as any;
+        }
+        this.sendResponse(response);
+    }
+
+    protected async disconnectRequest(response: DebugProtocol.DisconnectResponse, args: DebugProtocol.DisconnectArguments): Promise<void> {
+        try {
+            if (this._connection && this._isConnected) {
+                try { await this._connection.sendRequest('disconnect', args); } catch {}
+            }
+            this._connection?.dispose();
+            this._ws?.close();
+        } finally {
+            this._isConnected = false;
+            this.sendResponse(response);
+        }
     }
 }

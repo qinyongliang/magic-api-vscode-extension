@@ -1,7 +1,9 @@
 import * as vscode from 'vscode';
 import { LanguageClient, LanguageClientOptions, ServerOptions } from 'vscode-languageclient/node';
 import { ServerManager } from './serverManager';
-import * as net from 'net';
+import { debug } from './logger';
+import WebSocket from 'ws';
+import { WebSocketMessageReader, WebSocketMessageWriter } from 'vscode-ws-jsonrpc/cjs';
 
 export class RemoteLspClient {
     private static instance: RemoteLspClient;
@@ -41,28 +43,29 @@ export class RemoteLspClient {
                 return;
             }
 
-            const lspUrl = serverManager.getLspUrl(currentServer.id);
+            const lspUrl = await serverManager.getLspUrl(currentServer.id);
             if (!lspUrl) {
                 vscode.window.showErrorMessage('无法获取 LSP 服务器地址');
                 return;
             }
-
-            // 解析 LSP 服务器地址
-            const url = new URL(lspUrl);
-            const host = url.hostname;
-            const port = parseInt(url.port) || 8081;
-
-            // 创建服务器选项
+            debug(`RemoteLspClient connecting to LSP: ${lspUrl}`);
+            // 使用 WebSocket 建立 JSON-RPC 连接
             const serverOptions: ServerOptions = () => {
                 return new Promise((resolve, reject) => {
-                    const socket = net.createConnection({ port, host }, () => {
-                        resolve({
-                            reader: socket,
-                            writer: socket
-                        });
+                    const ws = new WebSocket(lspUrl, { perMessageDeflate: false });
+                    ws.on('open', () => {
+                        const socket = {
+                            send: (content: string) => ws.send(content),
+                            onMessage: (cb: (data: any) => void) => ws.on('message', (data: any) => cb(typeof data === 'string' ? data : data?.toString?.() ?? '')),
+                            onError: (cb: (reason: any) => void) => ws.on('error', (err: any) => cb(err)),
+                            onClose: (cb: (code: number, reason: string) => void) => ws.on('close', (code: number, reason: any) => cb(code, typeof reason === 'string' ? reason : reason?.toString?.() ?? '')),
+                            dispose: () => ws.close()
+                        };
+                        const reader = new WebSocketMessageReader(socket);
+                        const writer = new WebSocketMessageWriter(socket);
+                        resolve({ reader, writer });
                     });
-                    
-                    socket.on('error', reject);
+                    ws.on('error', (err) => reject(err));
                 });
             };
 

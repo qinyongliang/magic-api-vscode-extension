@@ -5,6 +5,7 @@ import { info } from './logger';
 import { StatusBarManager } from './statusBarManager';
 import { RemoteLspClient } from './remoteLspClient';
 import { MagicApiDebugAdapterDescriptorFactory } from './debugAdapterFactory';
+import { MirrorWorkspaceManager } from './mirrorWorkspaceManager';
 
 export function activate(context: vscode.ExtensionContext) {
 	console.log('Magic API extension is now active!');
@@ -14,6 +15,7 @@ export function activate(context: vscode.ExtensionContext) {
 	const serverManager = ServerManager.getInstance();
 	const statusBarManager = StatusBarManager.getInstance();
 	const remoteLspClient = RemoteLspClient.getInstance();
+    const mirrorManager = MirrorWorkspaceManager.getInstance(context);
 
 	// 注册虚拟文件系统
     const fileSystemProvider = new MagicFileSystemProvider(serverManager.getCurrentClient()!, context.globalStorageUri);
@@ -66,6 +68,26 @@ export function activate(context: vscode.ExtensionContext) {
 	if (serverManager.getCurrentServer()) {
 		remoteLspClient.start();
 	}
+
+    // 如果当前打开的是镜像工作区，则绑定服务器并启动监听
+    const folders = vscode.workspace.workspaceFolders;
+    if (folders && folders.length > 0) {
+        (async () => {
+            const root = folders[0].uri;
+            const isMirror = await mirrorManager.isMirrorWorkspace(root);
+            if (isMirror) {
+                const meta = await mirrorManager.readMirrorMeta(root);
+                if (meta?.serverId) {
+                    await serverManager.setCurrentServer(meta.serverId);
+                    const client = serverManager.getCurrentClient();
+                    if (client) {
+                        const disposables = mirrorManager.startMirrorListeners(client, root);
+                        context.subscriptions.push(...disposables);
+                    }
+                }
+            }
+        })();
+    }
 }
 
 export function deactivate(): Thenable<void> | undefined {
@@ -106,9 +128,13 @@ function registerCommands(
 	const connectWorkspaceCommand = vscode.commands.registerCommand('magicApi.connectWorkspace', async () => {
 		const serverId = await serverManager.showServerPicker();
 		if (serverId) {
-			// 打开虚拟文件系统工作区
-			const uri = vscode.Uri.parse('magic-api:/');
-			await vscode.commands.executeCommand('vscode.openFolder', uri, { forceNewWindow: false });
+			// 打开本地镜像工作区（便于 AI 工具索引）
+            const client = serverManager.getCurrentClient();
+            if (!client) {
+                vscode.window.showErrorMessage('无法获取当前服务器客户端');
+                return;
+            }
+            await MirrorWorkspaceManager.getInstance(context).openMirrorWorkspace(client, serverId);
 		}
 	});
 

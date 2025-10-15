@@ -67,15 +67,19 @@ export class ServerManager {
     }
 
     // 获取 LSP 服务器地址
-    getLspUrl(serverId: string): string | null {
+    async getLspUrl(serverId: string): Promise<string | null> {
         const client = this.clients.get(serverId);
-        return client ? client.getLspServerUrl() : null;
+        if (!client) return null;
+        // 直接返回远端 WebSocket 地址
+        return client.getLspServerUrl();
     }
 
     // 获取调试服务器地址
-    getDebugUrl(serverId: string): string | null {
+    async getDebugUrl(serverId: string): Promise<string | null> {
         const client = this.clients.get(serverId);
-        return client ? client.getDebugServerUrl() : null;
+        if (!client) return null;
+        // 直接返回远端 WebSocket 地址（原生 JSON-RPC over WS）
+        return client.getDebugServerUrl();
     }
 
     // 设置当前服务器
@@ -83,7 +87,6 @@ export class ServerManager {
         if (serverId && !this.servers.has(serverId)) {
             throw new Error(`服务器 ${serverId} 不存在`);
         }
-
         this.currentServerId = serverId;
         await this.saveServers();
         this._onServerChanged.fire(serverId);
@@ -124,6 +127,7 @@ export class ServerManager {
 
         this.servers.delete(serverId);
         this.clients.delete(serverId);
+        // 无需处理桥接资源
 
         // 如果删除的是当前服务器，清空当前选择
         if (this.currentServerId === serverId) {
@@ -133,6 +137,8 @@ export class ServerManager {
 
         await this.saveServers();
     }
+
+    // 已移除桥接逻辑
     // 显示服务器选择器
     async showServerPicker(): Promise<string | null> {
         const servers = this.getServers();

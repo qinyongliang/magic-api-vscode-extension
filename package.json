@@ -292,6 +292,8 @@
     "axios": "^1.12.2",
     "vscode-debugadapter": "^1.51.0",
     "vscode-languageclient": "^8.1.0",
-    "ws": "^8.14.0"
+    "ws": "^8.14.0",
+    "vscode-ws-jsonrpc": "^1.0.2",
+    "tslib": "^2.6.2"
   }
 }
