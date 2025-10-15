@@ -16,13 +16,13 @@ export function activate(context: vscode.ExtensionContext) {
 	const remoteLspClient = RemoteLspClient.getInstance();
 
 	// 注册虚拟文件系统
-	const fileSystemProvider = new MagicFileSystemProvider(serverManager.getCurrentClient()!);
-	context.subscriptions.push(
-		vscode.workspace.registerFileSystemProvider('magic-api', fileSystemProvider, {
-			isCaseSensitive: true,
-			isReadonly: false
-		})
-	);
+    const fileSystemProvider = new MagicFileSystemProvider(serverManager.getCurrentClient()!, context.globalStorageUri);
+    context.subscriptions.push(
+        vscode.workspace.registerFileSystemProvider('magic-api', fileSystemProvider, {
+            isCaseSensitive: true,
+            isReadonly: false
+        })
+    );
 
 	// 监听服务器变化，更新文件系统提供者
 	serverManager.onServerChanged((serverId) => {

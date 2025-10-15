@@ -18,7 +18,9 @@ export interface MagicServerConfig {
 export interface CreateFileRequest {
     name: string;
     script: string;
-    groupId: string | null;
+    // 统一资源保存支持按目录路径定位分组
+    groupPath?: string; // 例如: "api/user" 或 "function/util"
+    groupId?: string | null; // 兼容旧接口，优先使用 groupPath
     type: MagicResourceType;
     method?: string;
     requestMapping?: string;
@@ -143,7 +145,7 @@ export class MagicApiClient {
     // 获取文件信息
     async getFile(fileId: string): Promise<MagicFileInfo | null> {
         try {
-            const urlPath = `${this.webPrefix}/file/get/${fileId}`;
+            const urlPath = `${this.webPrefix}/resource/get/${fileId}`;
             debug(`GetFile: baseURL=${this.config.url} path=${urlPath}`);
             const response = await this.httpClient.get(urlPath);
             return response.data.data || null;
@@ -156,7 +158,7 @@ export class MagicApiClient {
     // 保存文件
     async saveFile(file: MagicFileInfo): Promise<boolean> {
         try {
-            const response = await this.httpClient.post(`${this.webPrefix}/${file.type}/save`, file);
+            const response = await this.httpClient.post(`${this.webPrefix}/resource/save`, file);
             return response.data.code === 1;
         } catch (error) {
             console.error('保存文件失败:', error);
@@ -167,9 +169,16 @@ export class MagicApiClient {
     // 创建文件
     async createFile(request: CreateFileRequest): Promise<string | null> {
         try {
-            const response = await this.httpClient.post(`${this.webPrefix}/${request.type}/save`, request);
+            const response = await this.httpClient.post(`${this.webPrefix}/resource/save`, request as any);
             if (response.data.code === 1) {
-                return response.data.data.id || null;
+                const created = response.data.data || {};
+                // 更新缓存：需要存在目录信息
+                if (created?.id && request.groupPath) {
+                    const filePath = `${request.groupPath}/${request.name}.ms`;
+                    this.pathToIdCache.set(filePath, created.id);
+                    this.idToPathCache.set(created.id, filePath);
+                }
+                return created.id || null;
             }
             return null;
         } catch (error) {
@@ -254,6 +263,40 @@ export class MagicApiClient {
         }
         
         return path.join('/');
+    }
+
+    // 统一资源接口：获取所有目录（/magic-api/ 后相对路径）
+    async getResourceDirs(): Promise<string[]> {
+        try {
+            const urlPath = `${this.webPrefix}/resource/dirs`;
+            debug(`GetResourceDirs: baseURL=${this.config.url} path=${urlPath}`);
+            const response = await this.httpClient.get(urlPath);
+            const dirs: string[] = response.data.data || [];
+            return dirs;
+        } catch (error) {
+            logError(`获取资源目录失败: ${String(error)}`);
+            return [];
+        }
+    }
+
+    // 统一资源接口：按目录获取文件
+    async getResourceFiles(dir: string): Promise<MagicFileInfo[]> {
+        try {
+            const urlPath = `${this.webPrefix}/resource/files`;
+            debug(`GetResourceFiles: baseURL=${this.config.url} path=${urlPath} dir=${dir}`);
+            const response = await this.httpClient.get(urlPath, { params: { dir } });
+            const files: MagicFileInfo[] = response.data.data || [];
+            // 更新路径缓存（统一路径为 dir/<name>.ms）
+            for (const file of files) {
+                const filePath = `${dir}/${file.name}.ms`;
+                this.pathToIdCache.set(filePath, file.id);
+                this.idToPathCache.set(file.id, filePath);
+            }
+            return files;
+        } catch (error) {
+            logError(`获取资源文件失败: ${String(error)}`);
+            return [];
+        }
     }
 
     // 获取 LSP 服务器地址

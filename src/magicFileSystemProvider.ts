@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
+import { getAgentsManual } from './agentsManual';
 import { MagicApiClient } from './magicApiClient';
-import { MagicResourceType, MAGIC_RESOURCE_TYPES, isMagicResourceType } from './types';
+import { MagicResourceType, MAGIC_RESOURCE_TYPES } from './types';
 
 export interface MagicFileInfo {
     id: string;
@@ -37,7 +38,57 @@ export class MagicFileSystemProvider implements vscode.FileSystemProvider {
 
     readonly onDidChangeFile: vscode.Event<vscode.FileChangeEvent[]> = this._emitter.event;
 
-    constructor(private client: MagicApiClient) {}
+    constructor(private client: MagicApiClient, private configDir?: vscode.Uri) {}
+
+    private isAgentsUri(uri: vscode.Uri): boolean {
+        const p = uri.path.replace(/^\/+/, '');
+        return p === 'AGENTS.md';
+    }
+
+    private getAgentsFileUri(): vscode.Uri | undefined {
+        if (!this.configDir) return undefined;
+        return vscode.Uri.joinPath(this.configDir, 'AGENTS.md');
+    }
+
+    private async ensureConfigDirExists(): Promise<void> {
+        if (!this.configDir) return;
+        try {
+            await vscode.workspace.fs.stat(this.configDir);
+        } catch {
+            await vscode.workspace.fs.createDirectory(this.configDir);
+        }
+    }
+
+    private generateAgentsContent(): string {
+        return getAgentsManual();
+    }
+
+    private async readAgentsFile(): Promise<Uint8Array> {
+        const agentsUri = this.getAgentsFileUri();
+        if (!agentsUri) {
+            const content = this.generateAgentsContent();
+            return Buffer.from(content, 'utf8');
+        }
+        await this.ensureConfigDirExists();
+        let exists = true;
+        try {
+            await vscode.workspace.fs.stat(agentsUri);
+        } catch {
+            exists = false;
+        }
+        if (!exists) {
+            const content = this.generateAgentsContent();
+            await vscode.workspace.fs.writeFile(agentsUri, Buffer.from(content, 'utf8'));
+        }
+        return vscode.workspace.fs.readFile(agentsUri);
+    }
+
+    private async writeAgentsFile(content: Uint8Array): Promise<void> {
+        const agentsUri = this.getAgentsFileUri();
+        if (!agentsUri) return;
+        await this.ensureConfigDirExists();
+        await vscode.workspace.fs.writeFile(agentsUri, content);
+    }
 
     // 监听文件变化
     watch(uri: vscode.Uri, options: { recursive: boolean; excludes: string[]; }): vscode.Disposable {
@@ -45,35 +96,27 @@ export class MagicFileSystemProvider implements vscode.FileSystemProvider {
         return new vscode.Disposable(() => {});
     }
 
-    // 获取文件状态
+    // 获取文件状态（统一资源目录结构）
     async stat(uri: vscode.Uri): Promise<vscode.FileStat> {
-        const path = this.parsePath(uri);
-        
-        if (path.isRoot) {
-            return {
-                type: vscode.FileType.Directory,
-                ctime: Date.now(),
-                mtime: Date.now(),
-                size: 0
-            };
+        if (this.isAgentsUri(uri)) {
+            return { type: vscode.FileType.File, ctime: Date.now(), mtime: Date.now(), size: (await this.readAgentsFile()).length };
+        }
+        const p = this.parsePath(uri);
+        if (p.isRoot) {
+            return { type: vscode.FileType.Directory, ctime: Date.now(), mtime: Date.now(), size: 0 };
         }
 
-        if (path.isTypeRoot) {
-            return {
-                type: vscode.FileType.Directory,
-                ctime: Date.now(),
-                mtime: Date.now(),
-                size: 0
-            };
-        }
-
-        if (path.fileId) {
-            // 获取文件信息
-            const fileInfo = await this.client.getFile(path.fileId);
-            if (!fileInfo) {
-                throw vscode.FileSystemError.FileNotFound(uri);
+        if (p.isFile) {
+            const filePath = `${p.dir}/${p.fileName}.ms`;
+            let fid = this.client.getFileIdByPath(filePath);
+            if (!fid) {
+                // 填充缓存
+                await this.client.getResourceFiles(p.dir);
+                fid = this.client.getFileIdByPath(filePath);
             }
-
+            if (!fid) throw vscode.FileSystemError.FileNotFound(uri);
+            const fileInfo = await this.client.getFile(fid);
+            if (!fileInfo) throw vscode.FileSystemError.FileNotFound(uri);
             return {
                 type: vscode.FileType.File,
                 ctime: fileInfo.createTime || Date.now(),
@@ -82,101 +125,88 @@ export class MagicFileSystemProvider implements vscode.FileSystemProvider {
             };
         }
 
-        if (path.groupId) {
-            // 获取分组信息
-            const groupInfo = await this.client.getGroup(path.groupId);
-            if (!groupInfo) {
-                throw vscode.FileSystemError.FileNotFound(uri);
-            }
-
-            return {
-                type: vscode.FileType.Directory,
-                ctime: groupInfo.createTime || Date.now(),
-                mtime: groupInfo.updateTime || Date.now(),
-                size: 0
-            };
+        // 目录：仅由统一目录列表驱动
+        const files = await this.client.getResourceFiles(p.dir);
+        if (files) {
+            return { type: vscode.FileType.Directory, ctime: Date.now(), mtime: Date.now(), size: 0 };
         }
-
         throw vscode.FileSystemError.FileNotFound(uri);
     }
 
-    // 读取目录
+    // 读取目录（统一资源目录结构）
     async readDirectory(uri: vscode.Uri): Promise<[string, vscode.FileType][]> {
-        const path = this.parsePath(uri);
+        const p = this.parsePath(uri);
         const entries: [string, vscode.FileType][] = [];
 
-        if (path.isRoot) {
-            // 根目录显示所有资源类型文件夹
-            for (const t of MAGIC_RESOURCE_TYPES) {
-                entries.push([t, vscode.FileType.Directory]);
+        const dirs = await this.client.getResourceDirs();
+        if (p.isRoot) {
+            // 展示顶层目录：严格使用服务返回的第一段
+            const topSet = new Set<string>();
+            for (const d of dirs) {
+                const seg = d.split('/')[0];
+                if (seg) topSet.add(seg);
             }
+            for (const name of Array.from(topSet)) entries.push([name, vscode.FileType.Directory]);
+            // 根目录追加 AGENTS.md
+            entries.push(['AGENTS.md', vscode.FileType.File]);
             return entries;
         }
 
-        if (path.isTypeRoot) {
-            // 获取该类型的根分组
-            const groups = await this.client.getGroups(path.type!);
-            for (const group of groups) {
-                if (!group.parentId) {
-                    entries.push([group.name, vscode.FileType.Directory]);
-                }
+        // 子目录：展示 p.dir 的子目录与文件
+        const childDirSet = new Set<string>();
+        const prefix = p.dir + '/';
+        for (const d of dirs) {
+            if (d.startsWith(prefix)) {
+                const rest = d.substring(prefix.length);
+                const next = rest.split('/')[0];
+                if (next) childDirSet.add(next);
             }
-
-            // 获取该类型根目录下的文件
-            const files = await this.client.getFiles(path.type!, null);
-            for (const file of files) {
-                entries.push([`${file.name}.ms`, vscode.FileType.File]);
-            }
-            return entries;
         }
+        for (const name of Array.from(childDirSet)) entries.push([name, vscode.FileType.Directory]);
 
-        if (path.groupId) {
-            // 获取子分组
-            const groups = await this.client.getGroups(path.type!);
-            for (const group of groups) {
-                if (group.parentId === path.groupId) {
-                    entries.push([group.name, vscode.FileType.Directory]);
-                }
-            }
-
-            // 获取该分组下的文件
-            const files = await this.client.getFiles(path.type!, path.groupId);
-            for (const file of files) {
-                entries.push([`${file.name}.ms`, vscode.FileType.File]);
-            }
-            return entries;
-        }
-
+        const files = await this.client.getResourceFiles(p.dir);
+        for (const f of files) entries.push([`${f.name}.ms`, vscode.FileType.File]);
         return entries;
     }
 
     // 创建目录
     async createDirectory(uri: vscode.Uri): Promise<void> {
-        const path = this.parsePath(uri);
-        if (!path.type) {
+        const p = this.parsePath(uri);
+        if (p.isRoot) {
             throw vscode.FileSystemError.NoPermissions('Cannot create directory at root level');
         }
-
-        const parentPath = this.parsePath(vscode.Uri.parse(uri.toString().substring(0, uri.toString().lastIndexOf('/'))));
+        // 目录创建依旧走分组接口（后端已有），通过父目录路径解析 parentId
+        const parentUri = vscode.Uri.parse(uri.toString().substring(0, uri.toString().lastIndexOf('/')));
+        const parent = this.parsePath(parentUri);
         const groupName = uri.path.split('/').pop()!;
+        const type = parent.dir.split('/')[0] as MagicResourceType;
+        const groupPathSub = parent.dir.split('/').slice(1).join('/');
+        // 通过分组接口填充缓存并解析 parentId
+        await this.client.getGroups(type);
+        const parentId = this.client.getGroupIdByPath(`${type}/${groupPathSub}`) || null;
 
-        await this.client.createGroup({
-            name: groupName,
-            parentId: parentPath.groupId || null,
-            type: path.type
-        });
+        await this.client.createGroup({ name: groupName, parentId, type });
 
         this._fireSoon({ type: vscode.FileChangeType.Created, uri });
     }
 
     // 读取文件
     async readFile(uri: vscode.Uri): Promise<Uint8Array> {
-        const path = this.parsePath(uri);
-        if (!path.fileId) {
+        if (this.isAgentsUri(uri)) {
+            return this.readAgentsFile();
+        }
+        const p = this.parsePath(uri);
+        const filePath = `${p.dir}/${p.fileName}.ms`;
+        let fid = p.fileId || this.client.getFileIdByPath(filePath);
+        if (!fid) {
+            await this.client.getResourceFiles(p.dir);
+            fid = this.client.getFileIdByPath(filePath);
+        }
+        if (!fid) {
             throw vscode.FileSystemError.FileNotFound(uri);
         }
 
-        const fileInfo = await this.client.getFile(path.fileId);
+        const fileInfo = await this.client.getFile(fid);
         if (!fileInfo) {
             throw vscode.FileSystemError.FileNotFound(uri);
         }
@@ -186,12 +216,19 @@ export class MagicFileSystemProvider implements vscode.FileSystemProvider {
 
     // 写入文件
     async writeFile(uri: vscode.Uri, content: Uint8Array, options: { create: boolean; overwrite: boolean; }): Promise<void> {
-        const path = this.parsePath(uri);
+        if (this.isAgentsUri(uri)) {
+            await this.writeAgentsFile(content);
+            this._fireSoon({ type: vscode.FileChangeType.Changed, uri });
+            return;
+        }
+        const p = this.parsePath(uri);
         const script = Buffer.from(content).toString('utf8');
+        const type = p.dir.split('/')[0] as MagicResourceType;
+        const groupPathSub = p.dir.split('/').slice(1).join('/');
 
-        if (path.fileId) {
+        if (p.fileId) {
             // 更新现有文件
-            const fileInfo = await this.client.getFile(path.fileId);
+            const fileInfo = await this.client.getFile(p.fileId);
             if (!fileInfo) {
                 throw vscode.FileSystemError.FileNotFound(uri);
             }
@@ -209,13 +246,12 @@ export class MagicFileSystemProvider implements vscode.FileSystemProvider {
             }
 
             const fileName = uri.path.split('/').pop()!.replace('.ms', '');
-            const parentPath = this.parsePath(vscode.Uri.parse(uri.toString().substring(0, uri.toString().lastIndexOf('/'))));
-
+            // 通过统一资源保存接口，按目录路径创建
             await this.client.createFile({
                 name: fileName,
                 script,
-                groupId: parentPath.groupId || null,
-                type: path.type!
+                type,
+                groupPath: groupPathSub ? `${type}/${groupPathSub}` : `${type}`
             });
 
             this._fireSoon({ type: vscode.FileChangeType.Created, uri });
@@ -224,14 +260,29 @@ export class MagicFileSystemProvider implements vscode.FileSystemProvider {
 
     // 删除文件或目录
     async delete(uri: vscode.Uri, options: { recursive: boolean; }): Promise<void> {
-        const path = this.parsePath(uri);
-
-        if (path.fileId) {
-            await this.client.deleteFile(path.fileId);
-        } else if (path.groupId) {
-            await this.client.deleteGroup(path.groupId);
+        if (this.isAgentsUri(uri)) {
+            throw vscode.FileSystemError.NoPermissions('AGENTS.md cannot be deleted');
+        }
+        const p = this.parsePath(uri);
+        if (p.isFile) {
+            const filePath = `${p.dir}/${p.fileName}.ms`;
+            let fid = p.fileId || this.client.getFileIdByPath(filePath);
+            if (!fid) {
+                await this.client.getResourceFiles(p.dir);
+                fid = this.client.getFileIdByPath(filePath);
+            }
+            if (!fid) throw vscode.FileSystemError.FileNotFound(uri);
+            await this.client.deleteFile(fid);
         } else {
-            throw vscode.FileSystemError.NoPermissions('Cannot delete root directories');
+            const type = p.dir.split('/')[0] as MagicResourceType;
+            const groupSub = p.dir.split('/').slice(1).join('/');
+            if (!groupSub) {
+                throw vscode.FileSystemError.NoPermissions('Cannot delete type root directories');
+            }
+            await this.client.getGroups(type);
+            const gid = this.client.getGroupIdByPath(`${type}/${groupSub}`);
+            if (!gid) throw vscode.FileSystemError.FileNotFound(uri);
+            await this.client.deleteGroup(gid);
         }
 
         this._fireSoon({ type: vscode.FileChangeType.Deleted, uri });
@@ -239,8 +290,13 @@ export class MagicFileSystemProvider implements vscode.FileSystemProvider {
 
     // 重命名文件或目录
     async rename(oldUri: vscode.Uri, newUri: vscode.Uri, options: { overwrite: boolean; }): Promise<void> {
+        if (this.isAgentsUri(oldUri) || this.isAgentsUri(newUri)) {
+            throw vscode.FileSystemError.NoPermissions('AGENTS.md cannot be renamed');
+        }
         const oldPath = this.parsePath(oldUri);
         const newName = newUri.path.split('/').pop()!.replace('.ms', '');
+        const type = oldPath.dir.split('/')[0] as MagicResourceType;
+        const oldGroupPathStr = oldPath.dir.split('/').slice(1).join('/');
 
         if (oldPath.fileId) {
             const fileInfo = await this.client.getFile(oldPath.fileId);
@@ -252,8 +308,10 @@ export class MagicFileSystemProvider implements vscode.FileSystemProvider {
                 ...fileInfo,
                 name: newName
             });
-        } else if (oldPath.groupId) {
-            const groupInfo = await this.client.getGroup(oldPath.groupId);
+        } else if (!oldPath.isFile) {
+            // 目录重命名仍通过分组接口实现
+            const gid = this.client.getGroupIdByPath(`${type}/${oldGroupPathStr}`);
+            const groupInfo = gid ? await this.client.getGroup(gid) : null;
             if (!groupInfo) {
                 throw vscode.FileSystemError.FileNotFound(oldUri);
             }
@@ -262,6 +320,28 @@ export class MagicFileSystemProvider implements vscode.FileSystemProvider {
                 ...groupInfo,
                 name: newName
             });
+        } else {
+            // 尝试解析ID后再重命名
+            const fileName = oldUri.path.split('/').pop() || '';
+            if (fileName.endsWith('.ms')) {
+                const name = fileName.replace(/\.ms$/, '');
+                const fileKey = oldGroupPathStr ? `${type}/${oldGroupPathStr}/${name}.ms` : `${type}/${name}.ms`;
+                const fid = this.client.getFileIdByPath(fileKey);
+                if (fid) {
+                    const fileInfo = await this.client.getFile(fid);
+                    if (!fileInfo) throw vscode.FileSystemError.FileNotFound(oldUri);
+                    await this.client.saveFile({ ...fileInfo, name: newName });
+                } else {
+                    const gid = this.client.getGroupIdByPath(`${type}/${oldGroupPathStr}`);
+                    if (gid) {
+                        const groupInfo = await this.client.getGroup(gid);
+                        if (!groupInfo) throw vscode.FileSystemError.FileNotFound(oldUri);
+                        await this.client.saveGroup({ ...groupInfo, name: newName });
+                    } else {
+                        throw vscode.FileSystemError.FileNotFound(oldUri);
+                    }
+                }
+            }
         }
 
         this._fireSoon(
@@ -273,44 +353,24 @@ export class MagicFileSystemProvider implements vscode.FileSystemProvider {
     // 解析路径
     private parsePath(uri: vscode.Uri): {
         isRoot: boolean;
-        isTypeRoot: boolean;
-        type?: MagicResourceType;
-        groupId?: string;
+        isFile: boolean;
+        dir: string; // /magic-api/ 后的目录路径，例如 "api/user"
+        fileName?: string;
         fileId?: string;
-        groupPath?: string[];
     } {
-        const pathParts = uri.path.split('/').filter(p => p);
-        
-        if (pathParts.length === 0) {
-            return { isRoot: true, isTypeRoot: false };
+        const parts = uri.path.split('/').filter(Boolean);
+        if (parts.length === 0) {
+            return { isRoot: true, isFile: false, dir: '' };
         }
-
-        const maybeType = pathParts[0];
-        if (!isMagicResourceType(maybeType)) {
-            return { isRoot: false, isTypeRoot: false };
+        const isFile = parts[parts.length - 1].endsWith('.ms');
+        const dir = isFile ? parts.slice(0, -1).join('/') : parts.join('/');
+        const fileName = isFile ? parts[parts.length - 1].replace(/\.ms$/, '') : undefined;
+        let fileId: string | undefined;
+        if (isFile) {
+            const key = `${dir}/${fileName}.ms`;
+            fileId = this.client.getFileIdByPath(key);
         }
-        const type = maybeType as MagicResourceType;
-
-        if (pathParts.length === 1) {
-            return { isRoot: false, isTypeRoot: true, type };
-        }
-
-        // 解析文件或分组路径
-        const isFile = pathParts[pathParts.length - 1].endsWith('.ms');
-        const groupPath = isFile ? pathParts.slice(1, -1) : pathParts.slice(1);
-        
-        // 这里需要根据路径查找对应的分组ID和文件ID
-        // 实际实现中需要维护路径到ID的映射
-        
-        return {
-            isRoot: false,
-            isTypeRoot: false,
-            type,
-            groupPath,
-            // 这些需要通过API查询获得
-            groupId: undefined,
-            fileId: undefined
-        };
+        return { isRoot: false, isFile, dir, fileName, fileId };
     }
 
     // 触发文件变化事件
