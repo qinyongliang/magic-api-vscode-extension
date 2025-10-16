@@ -147,7 +147,7 @@ export class MirrorWorkspaceManager {
         const ensureGroups = async (type: MagicResourceType, groupPathSub: string): Promise<void> => {
             if (!groupPathSub) return;
             const segments = groupPathSub.split('/').filter(Boolean);
-            await client.getGroups(type);
+            await client.getResourceDirs();
             let parentId: string | null = null;
             let acc: string[] = [];
             for (const seg of segments) {
@@ -157,7 +157,7 @@ export class MirrorWorkspaceManager {
                 if (!gid) {
                     const newId: string | null = await client.createGroup({ name: seg, parentId, type });
                     // 刷新缓存以填充新建分组路径
-                    await client.getGroups(type);
+                    await client.getResourceDirs();
                     parentId = newId;
                 } else {
                     // 获取该分组的 ID 用作下一层的 parentId

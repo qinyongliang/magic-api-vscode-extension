@@ -181,8 +181,8 @@ export class MagicFileSystemProvider implements vscode.FileSystemProvider {
         const groupName = uri.path.split('/').pop()!;
         const type = parent.dir.split('/')[0] as MagicResourceType;
         const groupPathSub = parent.dir.split('/').slice(1).join('/');
-        // 通过分组接口填充缓存并解析 parentId
-        await this.client.getGroups(type);
+        // 通过资源树填充缓存并解析 parentId
+        await this.client.getResourceDirs();
         const parentId = this.client.getGroupIdByPath(`${type}/${groupPathSub}`) || null;
 
         await this.client.createGroup({ name: groupName, parentId, type });
@@ -235,7 +235,8 @@ export class MagicFileSystemProvider implements vscode.FileSystemProvider {
 
             await this.client.saveFile({
                 ...fileInfo,
-                script
+                script,
+                type
             });
 
             this._fireSoon({ type: vscode.FileChangeType.Changed, uri });
@@ -279,7 +280,7 @@ export class MagicFileSystemProvider implements vscode.FileSystemProvider {
             if (!groupSub) {
                 throw vscode.FileSystemError.NoPermissions('Cannot delete type root directories');
             }
-            await this.client.getGroups(type);
+            await this.client.getResourceDirs();
             const gid = this.client.getGroupIdByPath(`${type}/${groupSub}`);
             if (!gid) throw vscode.FileSystemError.FileNotFound(uri);
             await this.client.deleteGroup(gid);
@@ -306,10 +307,12 @@ export class MagicFileSystemProvider implements vscode.FileSystemProvider {
 
             await this.client.saveFile({
                 ...fileInfo,
-                name: newName
+                name: newName,
+                type
             });
         } else if (!oldPath.isFile) {
             // 目录重命名仍通过分组接口实现
+            await this.client.getResourceDirs();
             const gid = this.client.getGroupIdByPath(`${type}/${oldGroupPathStr}`);
             const groupInfo = gid ? await this.client.getGroup(gid) : null;
             if (!groupInfo) {
@@ -330,7 +333,7 @@ export class MagicFileSystemProvider implements vscode.FileSystemProvider {
                 if (fid) {
                     const fileInfo = await this.client.getFile(fid);
                     if (!fileInfo) throw vscode.FileSystemError.FileNotFound(oldUri);
-                    await this.client.saveFile({ ...fileInfo, name: newName });
+                    await this.client.saveFile({ ...fileInfo, name: newName, type });
                 } else {
                     const gid = this.client.getGroupIdByPath(`${type}/${oldGroupPathStr}`);
                     if (gid) {

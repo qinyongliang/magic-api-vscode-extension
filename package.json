@@ -41,6 +41,13 @@
         "configuration": "./language-configuration.json"
       }
     ],
+    "grammars": [
+      {
+        "language": "magic-script",
+        "scopeName": "source.magic-script",
+        "path": "./syntaxes/magic-script.tmLanguage.json"
+      }
+    ],
 
     "configuration": {
       "type": "object",

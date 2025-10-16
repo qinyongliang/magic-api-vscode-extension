@@ -1,0 +1,110 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Magic Script",
+  "scopeName": "source.magic-script",
+  "fileTypes": ["ms", "magic"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#importAlias" },
+    { "include": "source.js" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.magic-script",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.magic-script",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.triple.double.magic-script",
+          "begin": "\"\"\"",
+          "end": "\"\"\"",
+          "patterns": [
+            { "include": "#stringEscapes" }
+          ]
+        },
+        {
+          "name": "string.quoted.double.magic-script",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            { "include": "#stringEscapes" }
+          ]
+        },
+        {
+          "name": "string.quoted.single.magic-script",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            { "include": "#stringEscapes" }
+          ]
+        },
+        {
+          "name": "string.regexp.magic-script",
+          "begin": "/",
+          "end": "/[gimuy]*",
+          "patterns": [
+            { "name": "constant.character.escape.magic-script", "match": "\\/" }
+          ]
+        }
+      ]
+    },
+    "stringEscapes": {
+      "patterns": [
+        { "name": "constant.character.escape.magic-script", "match": "\\\\[btnrfe0'\"\\]" },
+        { "name": "constant.character.escape.unicode.magic-script", "match": "\\\\u[0-9A-Fa-f]{4}" }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.magic-script",
+          "match": "(?x)
+            (?:
+              0x[0-9A-Fa-f]+ |              # hex
+              0b[01]+ |                     # binary
+              0o[0-7]+ |                    # octal
+              (?:\\d+\\.\\d*|\\.\\d+|\\d+)(?:[eE][+-]?\\d+)? # decimal/float
+            )
+            (?:[bBsSlLfFdDmM])?             # type suffix
+          "
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.magic-script",
+          "match": "\\b(var|if|for|in|continue|break|return|exit|try|catch|finally|import|as|new|true|false|null|async|function)\\b"
+        }
+      ]
+    },
+    "importAlias": {
+      "patterns": [
+        {
+          "name": "meta.import.magic-script",
+          "begin": "\\bimport\\b",
+          "end": "$",
+          "patterns": [
+            { "name": "keyword.control.magic-script", "match": "\\bimport\\b" },
+            { "name": "keyword.control.magic-script", "match": "\\bas\\b" },
+            { "name": "string.quoted.single.magic-script", "begin": "'", "end": "'" },
+            { "name": "entity.name.variable.magic-script", "match": "[A-Za-z_][A-Za-z0-9_]*" }
+          ]
+        }
+      ]
+    }
+  }
+}

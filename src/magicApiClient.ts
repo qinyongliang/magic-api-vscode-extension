@@ -81,21 +81,36 @@ export class MagicApiClient {
     // 获取所有分组
     async getGroups(type: MagicResourceType): Promise<MagicGroupInfo[]> {
         try {
-            const urlPath = `${this.webPrefix}/group/list`;
+            // 通过统一资源树解析分组列表并填充缓存
+            const urlPath = `${this.webPrefix}/resource`;
             debug(`GetGroups: baseURL=${this.config.url} path=${urlPath} type=${type}`);
-            const response = await this.httpClient.get(urlPath, {
-                params: { type }
-            });
-            
-            const groups: MagicGroupInfo[] = response.data.data || [];
-            
-            // 更新路径缓存
-            for (const group of groups) {
-                const path = this.buildGroupPath(group, groups);
-                this.pathToIdCache.set(`${type}/${path}`, group.id);
-                this.idToPathCache.set(group.id, `${type}/${path}`);
+            const response = await this.httpClient.post(urlPath);
+            const tree: any = response.data?.data || {};
+            const root = tree[type];
+            if (!root) return [];
+            const groups: MagicGroupInfo[] = [];
+            const queue: any[] = [root];
+            while (queue.length) {
+                const cur = queue.shift();
+                const n = cur.node || {};
+                const isGroup = n && (typeof n.parentId !== 'undefined' || typeof n.type !== 'undefined');
+                if (isGroup && n.id && n.id !== '0') {
+                    const path = this.buildPathFromNode(root, n.id);
+                    const info: MagicGroupInfo = {
+                        id: n.id,
+                        name: n.name,
+                        path,
+                        parentId: n.parentId,
+                        type,
+                        createTime: n.createTime,
+                        updateTime: n.updateTime,
+                    };
+                    groups.push(info);
+                    this.pathToIdCache.set(`${type}/${path}`, n.id);
+                    this.idToPathCache.set(n.id, `${type}/${path}`);
+                }
+                for (const child of (cur.children || [])) queue.push(child);
             }
-            
             return groups;
         } catch (error) {
             logError(`获取分组失败: ${String(error)}`);
@@ -106,10 +121,27 @@ export class MagicApiClient {
     // 获取分组信息
     async getGroup(groupId: string): Promise<MagicGroupInfo | null> {
         try {
-            const urlPath = `${this.webPrefix}/group/get/${groupId}`;
-            debug(`GetGroup: baseURL=${this.config.url} path=${urlPath}`);
-            const response = await this.httpClient.get(urlPath);
-            return response.data.data || null;
+            // 通过资源树查找分组
+            const treeResp = await this.httpClient.post(`${this.webPrefix}/resource`);
+            const tree: any = treeResp.data?.data || {};
+            for (const type of Object.keys(tree)) {
+                const found = this.findGroupNodeById(tree[type], groupId);
+                if (found) {
+                    const n = found.node || {};
+                    const path = this.buildPathFromNode(tree[type], groupId);
+                    const info: MagicGroupInfo = {
+                        id: n.id,
+                        name: n.name,
+                        path,
+                        parentId: n.parentId,
+                        type: type as MagicResourceType,
+                        createTime: n.createTime,
+                        updateTime: n.updateTime,
+                    };
+                    return info;
+                }
+            }
+            return null;
         } catch (error) {
             logError(`获取分组信息失败: ${String(error)}`);
             return null;
@@ -119,22 +151,39 @@ export class MagicApiClient {
     // 获取文件列表
     async getFiles(type: MagicResourceType, groupId: string | null): Promise<MagicFileInfo[]> {
         try {
-            const urlPath = `${this.webPrefix}/${type}/list`;
-            debug(`GetFiles: baseURL=${this.config.url} path=${urlPath} groupId=${groupId ?? ''}`);
-            const response = await this.httpClient.get(urlPath, {
-                params: { groupId: groupId || '' }
-            });
-            
-            const files: MagicFileInfo[] = response.data.data || [];
-            
-            // 更新路径缓存
-            for (const file of files) {
-                const groupPath = this.idToPathCache.get(file.groupId) || '';
-                const filePath = groupPath ? `${groupPath}/${file.name}.ms` : `${type}/${file.name}.ms`;
-                this.pathToIdCache.set(filePath, file.id);
-                this.idToPathCache.set(file.id, filePath);
+            // 通过资源树解析指定分组的文件列表
+            const treeResp = await this.httpClient.post(`${this.webPrefix}/resource`);
+            const tree: any = treeResp.data?.data || {};
+            const root = tree[type];
+            if (!root || !groupId) return [];
+            const groupNode = this.findGroupNodeById(root, groupId);
+            if (!groupNode) return [];
+            const dir = this.buildPathFromNode(root, groupId);
+            const files: MagicFileInfo[] = [];
+            const children: any[] = groupNode.children || [];
+            for (const child of children) {
+                const n = child.node || {};
+                const isFile = n && typeof n.groupId !== 'undefined' && typeof n.type === 'undefined';
+                if (isFile) {
+                    const info: MagicFileInfo = {
+                        id: n.id,
+                        name: n.name,
+                        path: n.path || '',
+                        script: '',
+                        groupId: n.groupId,
+                        groupPath: dir,
+                        type,
+                        createTime: n.createTime,
+                        updateTime: n.updateTime,
+                        createBy: n.createBy,
+                        updateBy: n.updateBy,
+                    };
+                    files.push(info);
+                    const filePath = `${dir}/${n.name}.ms`;
+                    this.pathToIdCache.set(filePath, n.id);
+                    this.idToPathCache.set(n.id, filePath);
+                }
             }
-            
             return files;
         } catch (error) {
             logError(`获取文件列表失败: ${String(error)}`);
@@ -145,7 +194,7 @@ export class MagicApiClient {
     // 获取文件信息
     async getFile(fileId: string): Promise<MagicFileInfo | null> {
         try {
-            const urlPath = `${this.webPrefix}/resource/get/${fileId}`;
+            const urlPath = `${this.webPrefix}/resource/file/${fileId}`;
             debug(`GetFile: baseURL=${this.config.url} path=${urlPath}`);
             const response = await this.httpClient.get(urlPath);
             return response.data.data || null;
@@ -158,8 +207,31 @@ export class MagicApiClient {
     // 保存文件
     async saveFile(file: MagicFileInfo): Promise<boolean> {
         try {
-            const response = await this.httpClient.post(`${this.webPrefix}/resource/save`, file);
-            return response.data.code === 1;
+            const type = file.type || this.inferTypeFromId(file.id);
+            if (!type) {
+                logError('保存文件失败：无法解析资源类型');
+                return false;
+            }
+            const entity: any = {
+                id: file.id,
+                groupId: file.groupId,
+                name: file.name,
+                description: file.description,
+            };
+            if (type === 'api') {
+                entity.path = file.path || '';
+                entity.method = (file.method || 'GET').toUpperCase();
+                if (file.requestMapping) entity.requestMapping = file.requestMapping;
+            } else if (type === 'function') {
+                entity.path = file.path || '';
+            }
+            const combined = JSON.stringify(entity) + "\r\n================================\r\n" + (file.script || '');
+            const payload = this.rot13(combined);
+            const urlPath = `${this.webPrefix}/resource/file/${type}/save`;
+            debug(`SaveFile: path=${urlPath} id=${file.id} name=${file.name}`);
+            const response = await this.httpClient.post(urlPath, payload, { headers: { 'Content-Type': 'text/plain' } });
+            const ok = response.data?.code === 1;
+            return !!ok;
         } catch (error) {
             console.error('保存文件失败:', error);
             return false;
@@ -169,16 +241,42 @@ export class MagicApiClient {
     // 创建文件
     async createFile(request: CreateFileRequest): Promise<string | null> {
         try {
-            const response = await this.httpClient.post(`${this.webPrefix}/resource/save`, request as any);
+            const type = request.type;
+            // 解析分组ID（优先 groupId，其次通过资源树从 groupPath 推导）
+            let groupId = request.groupId || null;
+            if (!groupId && request.groupPath) {
+                await this.getResourceDirs();
+                groupId = this.getGroupIdByPath(request.groupPath) || null;
+            }
+            if (!groupId) {
+                vscode.window.showErrorMessage('创建文件失败：未定位到分组，请先创建分组目录');
+                return null;
+            }
+            const entity: any = {
+                groupId,
+                name: request.name,
+                description: request.description,
+            };
+            if (type === 'api') {
+                entity.path = request.requestMapping || request.name;
+                entity.method = (request.method || 'GET').toUpperCase();
+                if (request.requestMapping) entity.requestMapping = request.requestMapping;
+            } else if (type === 'function') {
+                entity.path = request.requestMapping || request.name;
+            }
+            const combined = JSON.stringify(entity) + "\r\n================================\r\n" + (request.script || '');
+            const payload = this.rot13(combined);
+            const urlPath = `${this.webPrefix}/resource/file/${type}/save`;
+            debug(`CreateFile: path=${urlPath} groupId=${groupId} name=${request.name}`);
+            const response = await this.httpClient.post(urlPath, payload, { headers: { 'Content-Type': 'text/plain' } });
             if (response.data.code === 1) {
-                const created = response.data.data || {};
-                // 更新缓存：需要存在目录信息
-                if (created?.id && request.groupPath) {
+                const id: string | null = response.data.data || null;
+                if (id && request.groupPath) {
                     const filePath = `${request.groupPath}/${request.name}.ms`;
-                    this.pathToIdCache.set(filePath, created.id);
-                    this.idToPathCache.set(created.id, filePath);
+                    this.pathToIdCache.set(filePath, id);
+                    this.idToPathCache.set(id, filePath);
                 }
-                return created.id || null;
+                return id;
             }
             return null;
         } catch (error) {
@@ -190,7 +288,9 @@ export class MagicApiClient {
     // 删除文件
     async deleteFile(fileId: string): Promise<boolean> {
         try {
-            const response = await this.httpClient.delete(`${this.webPrefix}/file/delete/${fileId}`);
+            const urlPath = `${this.webPrefix}/resource/delete`;
+            debug(`DeleteFile: path=${urlPath} id=${fileId}`);
+            const response = await this.httpClient.post(urlPath, null, { params: { id: fileId } });
             return response.data.code === 1;
         } catch (error) {
             console.error('删除文件失败:', error);
@@ -201,9 +301,11 @@ export class MagicApiClient {
     // 创建分组
     async createGroup(request: CreateGroupRequest): Promise<string | null> {
         try {
-            const response = await this.httpClient.post(`${this.webPrefix}/group/save`, request);
+            const urlPath = `${this.webPrefix}/resource/folder/save`;
+            debug(`CreateGroup: path=${urlPath} name=${request.name} type=${request.type}`);
+            const response = await this.httpClient.post(urlPath, request);
             if (response.data.code === 1) {
-                return response.data.data.id || null;
+                return response.data.data || null;
             }
             return null;
         } catch (error) {
@@ -215,7 +317,9 @@ export class MagicApiClient {
     // 保存分组
     async saveGroup(group: MagicGroupInfo): Promise<boolean> {
         try {
-            const response = await this.httpClient.post(`${this.webPrefix}/group/save`, group);
+            const urlPath = `${this.webPrefix}/resource/folder/save`;
+            debug(`SaveGroup: path=${urlPath} id=${group.id} name=${group.name}`);
+            const response = await this.httpClient.post(urlPath, group);
             return response.data.code === 1;
         } catch (error) {
             console.error('保存分组失败:', error);
@@ -226,7 +330,9 @@ export class MagicApiClient {
     // 删除分组
     async deleteGroup(groupId: string): Promise<boolean> {
         try {
-            const response = await this.httpClient.delete(`${this.webPrefix}/group/delete/${groupId}`);
+            const urlPath = `${this.webPrefix}/resource/delete`;
+            debug(`DeleteGroup: path=${urlPath} id=${groupId}`);
+            const response = await this.httpClient.post(urlPath, null, { params: { id: groupId } });
             return response.data.code === 1;
         } catch (error) {
             console.error('删除分组失败:', error);
@@ -265,13 +371,19 @@ export class MagicApiClient {
         return path.join('/');
     }
 
-    // 统一资源接口：获取所有目录（/magic-api/ 后相对路径）
+    // 统一资源接口：获取所有目录（从 /resource 资源树解析）
     async getResourceDirs(): Promise<string[]> {
         try {
-            const urlPath = `${this.webPrefix}/resource/dirs`;
+            const urlPath = `${this.webPrefix}/resource`;
             debug(`GetResourceDirs: baseURL=${this.config.url} path=${urlPath}`);
-            const response = await this.httpClient.get(urlPath);
-            const dirs: string[] = response.data.data || [];
+            const response = await this.httpClient.post(urlPath);
+            const tree: any = response.data?.data || {};
+            const dirs: string[] = [];
+            for (const type of Object.keys(tree)) {
+                // 顶层类型目录也加入，保证根展示类型名称
+                dirs.push(type);
+                this.collectGroupDirsFromNode(type, tree[type], [], dirs);
+            }
             return dirs;
         } catch (error) {
             logError(`获取资源目录失败: ${String(error)}`);
@@ -279,18 +391,42 @@ export class MagicApiClient {
         }
     }
 
-    // 统一资源接口：按目录获取文件
+    // 统一资源接口：按目录获取文件（从 /resource 资源树解析）
     async getResourceFiles(dir: string): Promise<MagicFileInfo[]> {
         try {
-            const urlPath = `${this.webPrefix}/resource/files`;
+            const urlPath = `${this.webPrefix}/resource`;
             debug(`GetResourceFiles: baseURL=${this.config.url} path=${urlPath} dir=${dir}`);
-            const response = await this.httpClient.get(urlPath, { params: { dir } });
-            const files: MagicFileInfo[] = response.data.data || [];
-            // 更新路径缓存（统一路径为 dir/<name>.ms）
-            for (const file of files) {
-                const filePath = `${dir}/${file.name}.ms`;
-                this.pathToIdCache.set(filePath, file.id);
-                this.idToPathCache.set(file.id, filePath);
+            const response = await this.httpClient.post(urlPath);
+            const tree: any = response.data?.data || {};
+            const [type, ...segs] = dir.split('/').filter(Boolean);
+            const root = tree[type];
+            if (!root) return [];
+            const groupNode = this.findGroupNodeByPath(root, segs);
+            const files: MagicFileInfo[] = [];
+            if (!groupNode) return files;
+            const children: any[] = groupNode.children || [];
+            for (const child of children) {
+                const n = child.node || {};
+                const isFile = n && typeof n.groupId !== 'undefined' && typeof n.type === 'undefined';
+                if (isFile) {
+                    const info: MagicFileInfo = {
+                        id: n.id,
+                        name: n.name,
+                        path: n.path || '',
+                        script: '',
+                        groupId: n.groupId,
+                        groupPath: dir,
+                        type: type as MagicResourceType,
+                        createTime: n.createTime,
+                        updateTime: n.updateTime,
+                        createBy: n.createBy,
+                        updateBy: n.updateBy,
+                    };
+                    files.push(info);
+                    const filePath = `${dir}/${n.name}.ms`;
+                    this.pathToIdCache.set(filePath, n.id);
+                    this.idToPathCache.set(n.id, filePath);
+                }
             }
             return files;
         } catch (error) {
@@ -351,5 +487,98 @@ export class MagicApiClient {
         const wsUrl = `${wsProto}://${hostPort}${prefix}/debug`;
         debug(`Debug WS URL computed: ${wsUrl} (host=${base.hostname}, port=${port}, basePath=${basePath || '/'}, cfgPrefix=${cfgPrefix || ''})`);
         return wsUrl;
+    }
+
+    // 通过资源树收集分组目录并填充缓存
+    private collectGroupDirsFromNode(type: string, node: any, pathSegs: string[], dirs: string[]): void {
+        const children: any[] = node?.children || [];
+        for (const child of children) {
+            const n = child.node || {};
+            const isGroup = n && (typeof n.parentId !== 'undefined' || typeof n.type !== 'undefined');
+            if (isGroup) {
+                const seg = n.name;
+                const newSegs = pathSegs.concat([seg]);
+                const dirPath = `${type}/${newSegs.join('/')}`;
+                dirs.push(dirPath);
+                if (n.id) {
+                    this.pathToIdCache.set(dirPath, n.id);
+                    this.idToPathCache.set(n.id, dirPath);
+                }
+                this.collectGroupDirsFromNode(type, child, newSegs, dirs);
+            }
+        }
+    }
+
+    // 按路径段在资源树中查找分组节点
+    private findGroupNodeByPath(root: any, segs: string[]): any | null {
+        let current = root;
+        for (const seg of segs) {
+            const next = (current.children || []).find((c: any) => {
+                const n = c.node || {};
+                const isGroup = n && (typeof n.parentId !== 'undefined' || typeof n.type !== 'undefined');
+                return isGroup && n.name === seg;
+            });
+            if (!next) return null;
+            current = next;
+        }
+        return current;
+    }
+
+    // 按 ID 在资源树中查找分组节点
+    private findGroupNodeById(root: any, id: string): any | null {
+        if (!root) return null;
+        const queue: any[] = [root];
+        while (queue.length) {
+            const cur = queue.shift();
+            const n = cur.node || {};
+            const isGroup = n && (typeof n.parentId !== 'undefined' || typeof n.type !== 'undefined');
+            if (isGroup && n.id === id) return cur;
+            const children: any[] = cur.children || [];
+            for (const child of children) queue.push(child);
+        }
+        return null;
+    }
+
+    // 从资源树根构建指定分组的路径
+    private buildPathFromNode(root: any, targetId: string): string {
+        const path: string[] = [];
+        // DFS 追溯路径
+        const dfs = (node: any, segs: string[]): boolean => {
+            const n = node.node || {};
+            const isGroup = n && (typeof n.parentId !== 'undefined' || typeof n.type !== 'undefined');
+            let localSegs = segs;
+            if (isGroup && n.name && n.id !== '0') {
+                localSegs = segs.concat([n.name]);
+            }
+            if (isGroup && n.id === targetId) {
+                path.push(...localSegs);
+                return true;
+            }
+            for (const child of (node.children || [])) {
+                if (dfs(child, localSegs)) return true;
+            }
+            return false;
+        };
+        dfs(root, []);
+        const type = (root?.node?.type) || '';
+        return path.join('/');
+    }
+
+    // 推断资源类型（api/function 等）
+    private inferTypeFromId(id?: string): MagicResourceType | undefined {
+        if (!id) return undefined;
+        const p = this.idToPathCache.get(id);
+        if (!p) return undefined;
+        const type = p.split('/')[0] as MagicResourceType;
+        return type;
+    }
+
+    // ROT13 编码（与后端 MagicResourceController.saveFile 解密一致）
+    private rot13(input: string): string {
+        return input.replace(/[a-zA-Z]/g, (c) => {
+            const base = c <= 'Z' ? 'A'.charCodeAt(0) : 'a'.charCodeAt(0);
+            const code = c.charCodeAt(0) - base;
+            return String.fromCharCode(((code + 13) % 26) + base);
+        });
     }
 }

@@ -4,6 +4,7 @@ import { ServerManager } from './serverManager';
 import { debug } from './logger';
 import WebSocket from 'ws';
 import { WebSocketMessageReader, WebSocketMessageWriter } from 'vscode-ws-jsonrpc/cjs';
+import { Buffer } from 'buffer';
 
 export class RemoteLspClient {
     private static instance: RemoteLspClient;
@@ -52,11 +53,32 @@ export class RemoteLspClient {
             // 使用 WebSocket 建立 JSON-RPC 连接
             const serverOptions: ServerOptions = () => {
                 return new Promise((resolve, reject) => {
+                    // Advertise LSP4J websocket subprotocols for better compatibility
                     const ws = new WebSocket(lspUrl, { perMessageDeflate: false });
                     ws.on('open', () => {
+                        const negotiatedProtocol: string = (ws as any).protocol || '';
+                        const isBase64 = negotiatedProtocol.endsWith('.base64');
+                        debug(`RemoteLspClient WS connected. Negotiated protocol: ${negotiatedProtocol || 'none'}`);
+
                         const socket = {
-                            send: (content: string) => ws.send(content),
-                            onMessage: (cb: (data: any) => void) => ws.on('message', (data: any) => cb(typeof data === 'string' ? data : data?.toString?.() ?? '')),
+                            send: (content: string) => {
+                                try {
+                                    const payload = isBase64
+                                        ? Buffer.from(content, 'utf8').toString('base64')
+                                        : content;
+                                    ws.send(payload);
+                                } catch (e) {
+                                    // Fallback to plain send
+                                    ws.send(content);
+                                }
+                            },
+                            onMessage: (cb: (data: any) => void) => ws.on('message', (data: any) => {
+                                const raw = typeof data === 'string' ? data : data?.toString?.() ?? '';
+                                const decoded = isBase64 && raw
+                                    ? (() => { try { return Buffer.from(raw, 'base64').toString('utf8'); } catch { return raw; } })()
+                                    : raw;
+                                cb(decoded);
+                            }),
                             onError: (cb: (reason: any) => void) => ws.on('error', (err: any) => cb(err)),
                             onClose: (cb: (code: number, reason: string) => void) => ws.on('close', (code: number, reason: any) => cb(code, typeof reason === 'string' ? reason : reason?.toString?.() ?? '')),
                             dispose: () => ws.close()
