@@ -329,10 +329,10 @@ export class MagicApiClient {
                 entity.path = file.path || '';
             }
             const combined = JSON.stringify(entity) + "\r\n================================\r\n" + (file.script || '');
-            const payload = this.rot13(combined);
+            const payload = this.encrypt(combined);
             const urlPath = `${this.webPrefix}/resource/file/${type}/save`;
             debug(`SaveFile: path=${urlPath} id=${file.id} name=${file.name}`);
-            const response = await this.httpClient.post(urlPath, payload, { headers: { 'Content-Type': 'text/plain' } });
+            const response = await this.httpClient.post(urlPath, payload, { headers: { 'Content-Type': 'application/json' }, params: { auto: 0 } });
             const ok = response.data?.code === 1;
             return !!ok;
         } catch (error) {
@@ -368,10 +368,10 @@ export class MagicApiClient {
                 entity.path = request.requestMapping || request.name;
             }
             const combined = JSON.stringify(entity) + "\r\n================================\r\n" + (request.script || '');
-            const payload = this.rot13(combined);
+            const payload = this.encrypt(combined);
             const urlPath = `${this.webPrefix}/resource/file/${type}/save`;
             debug(`CreateFile: path=${urlPath} groupId=${groupId} name=${request.name}`);
-            const response = await this.httpClient.post(urlPath, payload, { headers: { 'Content-Type': 'text/plain' } });
+            const response = await this.httpClient.post(urlPath, payload, { headers: { 'Content-Type': 'application/json' }, params: { auto: 0 } });
             if (response.data.code === 1) {
                 const id: string | null = response.data.data || null;
                 if (id && request.groupPath) {
@@ -716,5 +716,11 @@ export class MagicApiClient {
             const code = c.charCodeAt(0) - base;
             return String.fromCharCode(((code + 13) % 26) + base);
         });
+    }
+
+    // 与后端 ROT13Utils.encrypt 等效：Base64 后再 ROT13
+    private encrypt(input: string): string {
+        const base64 = Buffer.from(input, 'utf8').toString('base64');
+        return this.rot13(base64);
     }
 }
