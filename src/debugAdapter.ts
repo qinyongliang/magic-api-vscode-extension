@@ -109,8 +109,11 @@ export class MagicApiDebugSession extends DebugSession {
                 return;
             }
 
-            // 建立 WebSocket 连接并创建 JSON-RPC 通道
-            this._ws = new WebSocket(debugUrl, { perMessageDeflate: false });
+            // 建立 WebSocket 连接并创建 JSON-RPC 通道（附带认证头）
+            const serverManager = ServerManager.getInstance();
+            const client = serverManager.getCurrentClient();
+            const headers = client?.getAuthHeaders() || {};
+            this._ws = new WebSocket(debugUrl, { perMessageDeflate: false, headers });
 
             this._ws.on('open', async () => {
                 const socket = {

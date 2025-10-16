@@ -53,8 +53,10 @@ export class RemoteLspClient {
             // 使用 WebSocket 建立 JSON-RPC 连接
             const serverOptions: ServerOptions = () => {
                 return new Promise((resolve, reject) => {
+                    const client = serverManager.getCurrentClient();
+                    const headers = client?.getAuthHeaders() || {};
                     // Advertise LSP4J websocket subprotocols for better compatibility
-                    const ws = new WebSocket(lspUrl, { perMessageDeflate: false });
+                    const ws = new WebSocket(lspUrl, { perMessageDeflate: false, headers });
                     ws.on('open', () => {
                         const negotiatedProtocol: string = (ws as any).protocol || '';
                         const isBase64 = negotiatedProtocol.endsWith('.base64');

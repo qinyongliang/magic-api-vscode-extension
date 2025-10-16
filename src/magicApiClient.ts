@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import axios from 'axios';
+import { Buffer } from 'buffer';
 import { debug, info, error as logError } from './logger';
 import { MagicFileInfo, MagicGroupInfo } from './magicFileSystemProvider';
 import { MagicResourceType } from './types';
@@ -35,16 +36,19 @@ export interface CreateGroupRequest {
 }
 
 export class MagicApiClient {
+    private exposeHeaders: string = 'magic-token';
     private httpClient: any;
     private pathToIdCache = new Map<string, string>();
     private idToPathCache = new Map<string, string>();
     private webPrefix: string;
+    private sessionToken?: string;
+    private loginInFlight?: Promise<string | null>;
 
     constructor(private config: MagicServerConfig) {
         // 读取可配置的接口前缀
         const cfg = vscode.workspace.getConfiguration('magicApi');
         this.webPrefix = cfg.get<string>('webPrefix', '/magic/web');
-
+        
         this.httpClient = axios.create({
             baseURL: config.url,
             timeout: 30000,
@@ -55,9 +59,9 @@ export class MagicApiClient {
 
         debug(`MagicApiClient init: baseURL=${config.url}, webPrefix=${this.webPrefix}, lspPort=${config.lspPort || 8081}, debugPort=${config.debugPort || 8082}`);
 
-        // 设置认证
+        // 设置认证：优先使用 magic-token 头
         if (config.token) {
-            this.httpClient.defaults.headers.common['Authorization'] = `Bearer ${config.token}`;
+            this.httpClient.defaults.headers.common[this.exposeHeaders] = config.token;
         } else if (config.username && config.password) {
             this.httpClient.defaults.auth = {
                 username: config.username,
@@ -65,17 +69,116 @@ export class MagicApiClient {
             };
         }
 
-        // 响应拦截器处理错误
-        this.httpClient.interceptors.response.use(
-            (response: any) => response,
-            (error: any) => {
-                const status = error?.response?.status;
-                const path = error?.config?.url;
-                debug(`HTTP error: status=${status ?? 'n/a'} url=${path ?? 'n/a'} message=${error.message}`);
-                vscode.window.showErrorMessage(`Magic API 请求失败: ${error.message}`);
-                return Promise.reject(error);
-            }
+        // 请求拦截：若已有令牌则自动附加 Authorization
+        this.httpClient.interceptors.request.use(
+            (cfg: any) => {
+                const token = this.sessionToken || this.config.token;
+                if (token) {
+                    cfg.headers = cfg.headers || {};
+                    // 统一使用 magic-token 头；同时附带大小写变体以提升兼容性
+                    if (!cfg.headers['magic-token']) cfg.headers['magic-token'] = token;
+                    if (!cfg.headers['Magic-Token']) cfg.headers['Magic-Token'] = token;
+                }
+                return cfg;
+            },
+            (err: any) => Promise.reject(err)
         );
+
+        // 响应拦截器：同时在成功分支与错误分支处理鉴权失效（code=401 或消息提示）并自动登录重试
+        this.httpClient.interceptors.response.use(
+            async (response: any) => {
+                try {
+                    const body =  response?.data;
+                    const code = typeof body?.code !== 'undefined' ? body.code : undefined;
+                    const message = body?.message || '';
+                    const path = response?.config?.url;
+
+                    const isTokenInvalid = code === 401 || /token无效/i.test(String(message));
+                    if (isTokenInvalid && response?.config && !response.config._retry) {
+                        response.config._retry = true;
+                        debug(`HTTP 200 但业务码为401/token无效: url=${path ?? 'n/a'}，尝试自动登录并重试`);
+                        const token = await this.ensureLogin();
+                        if (token) {
+                            response.config.headers = response.config.headers || {};
+                            response.config.headers[this.exposeHeaders] = token;
+                            try {
+                                return await this.httpClient.request(response.config);
+                            } catch (retryErr: any) {
+                                const rStatus = retryErr?.response?.status;
+                                debug(`重试失败: status=${rStatus ?? 'n/a'} url=${path ?? 'n/a'} message=${retryErr?.message}`);
+                                vscode.window.showErrorMessage(`请求重试失败: ${retryErr?.message}`);
+                                return Promise.reject(retryErr);
+                            }
+                        }
+                    }
+                } catch (e) {
+                    // 安全兜底：若解析失败则直接返回原响应
+                }
+                return response;
+            },
+            (error: any) => error
+        )
+    }
+
+    // 暴露 WS/HTTP 通用认证头（用于 WebSocket 握手传递）
+    getAuthHeaders(): Record<string, string> {
+        const headers: Record<string, string> = {};
+        const token = this.sessionToken || this.config.token;
+        if (token) {
+            headers['magic-token'] = token;
+            headers['Magic-Token'] = token;
+            return headers;
+        }
+        if (this.config.username && this.config.password) {
+            // 某些后端可能在 WS 握手阶段不支持 Basic，这里仅在无 token 时尝试提供
+            const basic = Buffer.from(`${this.config.username}:${this.config.password}`, 'utf8').toString('base64');
+            headers['Authorization'] = `Basic ${basic}`;
+        }
+        return headers;
+    }
+
+    // 确保已登录（有令牌），避免重复登录
+    private async ensureLogin(): Promise<string | null> {
+        if (this.sessionToken || this.config.token) {
+            return this.sessionToken ?? this.config.token ?? null;
+        }
+        if (!this.loginInFlight) {
+            this.loginInFlight = this.login();
+        }
+        const token = await this.loginInFlight;
+        this.loginInFlight = undefined;
+        return token;
+    }
+
+    // 使用用户名密码自动登录并获取令牌（兼容多种返回结构与路径）
+    private async login(): Promise<string | null> {
+        const { username, password } = this.config;
+        if (!username || !password) {
+            debug('未配置用户名/密码，无法自动登录获取令牌');
+            return null;
+        }
+        try {
+            const axiosClient = axios.create({
+                baseURL: this.httpClient.getUri(),
+                timeout: 3000,
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                },
+            });
+            const resp = await axiosClient.post(`${this.webPrefix}/login`, `username=${username}&password=${password}`);
+            this.exposeHeaders = (resp.headers['access-control-expose-headers'] || '').toLowerCase();
+            const token = resp.headers[this.exposeHeaders] 
+            if (typeof token === 'string' && token.length > 0) {
+                this.sessionToken = token;
+                this.httpClient.defaults.headers.common[this.exposeHeaders] = token;
+                debug(`登录成功，令牌已更新并附加到请求头: ${this.exposeHeaders}`);
+                return token;
+            }
+        } catch (e: any) {
+            debug(`登录失败 : ${String(e?.message || e)}`);
+        }
+        vscode.window.showErrorMessage('自动登录失败：未能获取令牌');
+        return null;
     }
 
     // 获取所有分组
@@ -371,11 +474,44 @@ export class MagicApiClient {
         return path.join('/');
     }
 
-    // 统一资源接口：获取所有目录（从 /resource 资源树解析）
+    // 获取所有目录（优先使用原始接口 /resource/dirs，失败时回退到 /resource 树）
     async getResourceDirs(): Promise<string[]> {
+        // 尝试原始实现：GET /resource/dirs
+        // try {
+        //     const urlPath = `${this.webPrefix}/resource/dirs`;
+        //     debug(`GetResourceDirs[dirs]: baseURL=${this.config.url} path=${urlPath}`);
+        //     const response = await this.httpClient.get(urlPath);
+        //     const raw = response.data;
+        //     const arr = Array.isArray(raw) ? raw
+        //         : Array.isArray(raw?.data) ? raw.data
+        //         : (raw?.code === 1 && Array.isArray(raw?.data)) ? raw.data
+        //         : [];
+        //     let dirs: string[] = (arr || []).map((s: any) => String(s)).filter(Boolean);
+        //     // 兼容可能包含存储前缀的返回值，如 /magic-api/api/user
+        //     dirs = dirs.map((d) => d.replace(/^\/?magic-api\//, '').replace(/^\/+/, ''));
+        //     if (dirs.length > 0) {
+        //         // 为了兼容依赖分组ID的操作（创建/删除），补充一次树以填充缓存映射
+        //         try {
+        //             const treePath = `${this.webPrefix}/resource`;
+        //             debug(`GetResourceDirs[fill-cache]: baseURL=${this.config.url} path=${treePath}`);
+        //             const resp2 = await this.httpClient.post(treePath);
+        //             const tree: any = resp2.data?.data || {};
+        //             for (const type of Object.keys(tree)) {
+        //                 this.collectGroupDirsFromNode(type, tree[type], [], []);
+        //             }
+        //         } catch (e) {
+        //             debug(`填充目录缓存失败（可忽略）: ${String(e)}`);
+        //         }
+        //     }
+        //         return dirs;
+        // } catch (e) {
+        //     debug(`GetResourceDirs[dirs] 调用失败，回退到 /resource 树: ${String(e)}`);
+        // }
+
+        // POST /resource 树
         try {
             const urlPath = `${this.webPrefix}/resource`;
-            debug(`GetResourceDirs: baseURL=${this.config.url} path=${urlPath}`);
+            debug(`GetResourceDirs[tree]: baseURL=${this.config.url} path=${urlPath}`);
             const response = await this.httpClient.post(urlPath);
             const tree: any = response.data?.data || {};
             const dirs: string[] = [];
@@ -391,11 +527,11 @@ export class MagicApiClient {
         }
     }
 
-    // 统一资源接口：按目录获取文件（从 /resource 资源树解析）
+    // 按目录获取文件（优先使用原始接口 /resource/files?dir=...，失败时回退到 /resource 树）
     async getResourceFiles(dir: string): Promise<MagicFileInfo[]> {
         try {
             const urlPath = `${this.webPrefix}/resource`;
-            debug(`GetResourceFiles: baseURL=${this.config.url} path=${urlPath} dir=${dir}`);
+            debug(`GetResourceFiles[tree]: baseURL=${this.config.url} path=${urlPath} dir=${dir}`);
             const response = await this.httpClient.post(urlPath);
             const tree: any = response.data?.data || {};
             const [type, ...segs] = dir.split('/').filter(Boolean);
@@ -410,11 +546,11 @@ export class MagicApiClient {
                 const isFile = n && typeof n.groupId !== 'undefined' && typeof n.type === 'undefined';
                 if (isFile) {
                     const info: MagicFileInfo = {
-                        id: n.id,
-                        name: n.name,
-                        path: n.path || '',
+                        id: String(n.id),
+                        name: String(n.name),
+                        path: String(n.path || ''),
                         script: '',
-                        groupId: n.groupId,
+                        groupId: String(n.groupId || ''),
                         groupPath: dir,
                         type: type as MagicResourceType,
                         createTime: n.createTime,
@@ -424,8 +560,8 @@ export class MagicApiClient {
                     };
                     files.push(info);
                     const filePath = `${dir}/${n.name}.ms`;
-                    this.pathToIdCache.set(filePath, n.id);
-                    this.idToPathCache.set(n.id, filePath);
+                    this.pathToIdCache.set(filePath, info.id);
+                    this.idToPathCache.set(info.id, filePath);
                 }
             }
             return files;
