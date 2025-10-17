@@ -1,10 +1,11 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { MagicApiClient, MagicServerConfig } from './magicApiClient';
+import { MagicApiClient, MagicServerConfig, MagicGroupMetaRaw } from './magicApiClient';
 import { getAgentsManual } from './agentsManual';
 import { MAGIC_RESOURCE_TYPES, MagicResourceType } from './types';
 import { Buffer } from 'buffer';
 import os from 'os';
+import { diff_match_patch, DIFF_DELETE, DIFF_EQUAL, DIFF_INSERT } from 'diff-match-patch';
 
 interface MirrorMeta {
     createdAt: number;
@@ -35,7 +36,7 @@ interface MirrorFileMeta {
     groupPath: string; // 目录路径（包含类型，例如 "api/user"）
     path?: string; // 资源路径（例如 API 的 mapping 或函数路径）
     method?: string; // API 方法
-    requestMapping?: string; // API 映射（兼容字段）
+    requestMapping?: string; // API 映射
     description?: string; // 描述
     locked?: boolean; // 锁定
     // —— 类型专属字段（根据服务器导出定义） ——
@@ -101,16 +102,16 @@ export class MirrorWorkspaceManager {
 
     // 判断当前工作区是否为镜像工作区
     public async isMirrorWorkspace(folder: vscode.Uri): Promise<boolean> {
-        if("file" !== folder.scheme) {
-            return false
+        if("file" === folder.scheme) {
+            try {
+                const metaUri = vscode.Uri.joinPath(folder, '.magic-api-mirror.json');
+                await vscode.workspace.fs.stat(metaUri);
+                return true;
+            } catch {
+                return false;
+            }
         }
-        try {
-            const metaUri = vscode.Uri.joinPath(folder, '.magic-api-mirror.json');
-            await vscode.workspace.fs.stat(metaUri);
-            return true;
-        } catch {
-            return false;
-        }
+        return false;
     }
 
     public async readMirrorMeta(folder: vscode.Uri): Promise<MirrorMeta | null> {
@@ -170,6 +171,26 @@ export class MirrorWorkspaceManager {
         return vscode.Uri.joinPath(dirUri, metaName);
     }
 
+    // 新增：计算某分组目录的分组元数据文件路径 (.group.meta.json)
+    private getGroupMetaFileUriFor(root: vscode.Uri, type: MagicResourceType, groupPathSub: string | undefined): vscode.Uri {
+        const dirUri = vscode.Uri.joinPath(root, type, ...(groupPathSub ? groupPathSub.split('/') : []));
+        const metaName = `.group.meta.json`;
+        return vscode.Uri.joinPath(dirUri, metaName);
+    }
+
+    // 新增：读取某分组目录的分组元数据
+    private async readLocalGroupMeta(root: vscode.Uri, type: MagicResourceType, groupPathSub: string | undefined): Promise<MagicGroupMetaRaw | null> {
+        const metaUri = this.getGroupMetaFileUriFor(root, type, groupPathSub);
+        try {
+            const buf = await vscode.workspace.fs.readFile(metaUri);
+            const text = Buffer.from(buf).toString('utf8');
+            const obj = JSON.parse(text);
+            return obj as MagicGroupMetaRaw;
+        } catch {
+            return null;
+        }
+    }
+
     // 读取某文件对应的本地元数据
     private async readLocalMeta(root: vscode.Uri, type: MagicResourceType, groupPathSub: string | undefined, fileName: string): Promise<MirrorFileMeta | null> {
         const metaUri = this.getMetaFileUriFor(root, type, groupPathSub, fileName);
@@ -190,6 +211,14 @@ export class MirrorWorkspaceManager {
         const groupPathSub = segs.slice(1).join('/');
         const metaUri = this.getMetaFileUriFor(root, type, groupPathSub, meta.name);
         // 确保目录存在
+        const dirUri = vscode.Uri.joinPath(root, type, ...(groupPathSub ? groupPathSub.split('/') : []));
+        await this.ensureDir(dirUri);
+        await vscode.workspace.fs.writeFile(metaUri, Buffer.from(JSON.stringify(meta, null, 2), 'utf8'));
+    }
+
+    // 新增：写入某分组目录的分组元数据 (.group.meta.json)
+    private async writeLocalGroupMeta(root: vscode.Uri, type: MagicResourceType, groupPathSub: string | undefined, meta: MagicGroupMetaRaw): Promise<void> {
+        const metaUri = this.getGroupMetaFileUriFor(root, type, groupPathSub);
         const dirUri = vscode.Uri.joinPath(root, type, ...(groupPathSub ? groupPathSub.split('/') : []));
         await this.ensureDir(dirUri);
         await vscode.workspace.fs.writeFile(metaUri, Buffer.from(JSON.stringify(meta, null, 2), 'utf8'));
@@ -219,18 +248,14 @@ export class MirrorWorkspaceManager {
         // 注入类型专属字段（API/任务等），并保留服务端原始扩展字段
         const raw = (info as any).extra ?? info;
         if (type === 'api') {
-            meta.params = raw.params ?? raw.parameters ?? undefined;
+            meta.params = raw.params ?? undefined;
             meta.headers = raw.headers ?? undefined;
             meta.contentType = raw.contentType ?? undefined;
-            // 兼容不同命名的超时字段
-            meta.timeout = typeof raw.timeout === 'number' ? raw.timeout
-                : (typeof raw.timeoutMs === 'number' ? raw.timeoutMs : undefined);
+            meta.timeout = (typeof raw.timeout === 'number') ? raw.timeout : undefined;
         } else if (type === 'task') {
-            meta.cron = raw.cron ?? raw.cronExpression ?? undefined;
-            meta.enabled = (typeof raw.enabled !== 'undefined') ? !!raw.enabled
-                : ((typeof raw.enable !== 'undefined') ? !!raw.enable : undefined);
-            meta.executeOnStart = (typeof raw.executeOnStart !== 'undefined') ? !!raw.executeOnStart
-                : ((typeof raw.runOnStart !== 'undefined') ? !!raw.runOnStart : undefined);
+            meta.cron = raw.cron ?? undefined;
+            meta.enabled = (typeof raw.enabled !== 'undefined') ? !!raw.enabled : undefined;
+            meta.executeOnStart = (typeof raw.executeOnStart !== 'undefined') ? !!raw.executeOnStart : undefined;
         }
 
         try {
@@ -265,9 +290,86 @@ export class MirrorWorkspaceManager {
         const copy: Record<string, any> = { ...meta };
         // 忽略仅本地使用的时间戳
         delete copy.localUpdateTime;
+        // 忽略扩展字段，避免与已映射字段造成重复语义的噪音
+        delete (copy as any).extra;
         // 元数据比较不需要脚本，脚本差异单独比较
         // 保留服务端相关字段（如 updateTime、id、groupPath 等）以体现真实差异
         return copy;
+    }
+
+    // 使用 token 级 diff 生成冲突文件内容（适配 Merge Editor）
+    private tokenizeForDiff(text: string): string[] {
+        const re = /(\s+|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`|[A-Za-z_]\w*|\d+\.\d+|\d+|[{}()\[\].,;:+\-*/%&|^!~<>?=])/g;
+        const tokens: string[] = [];
+        let lastIndex = 0;
+        let m: RegExpExecArray | null;
+        while ((m = re.exec(text)) !== null) {
+            if (m.index > lastIndex) {
+                tokens.push(text.slice(lastIndex, m.index));
+            }
+            tokens.push(m[0]);
+            lastIndex = re.lastIndex;
+        }
+        if (lastIndex < text.length) tokens.push(text.slice(lastIndex));
+        return tokens;
+    }
+
+    private encodeTokensWithDict(tokens: string[], dict: Map<string, string>, nextCodeRef: { value: number }): string {
+        let out = '';
+        for (const tok of tokens) {
+            let code = dict.get(tok);
+            if (!code) {
+                code = String.fromCharCode(nextCodeRef.value++);
+                dict.set(tok, code);
+            }
+            out += code;
+        }
+        return out;
+    }
+
+    private decodeEncoded(encoded: string, dict: Map<string, string>): string {
+        const rev = new Map<string, string>();
+        for (const [tok, code] of dict.entries()) rev.set(code, tok);
+        let out = '';
+        for (const ch of encoded) {
+            out += rev.get(ch) ?? '';
+        }
+        return out;
+    }
+
+    private generateTokenConflict(local: string, server: string): string {
+        const dmp = new diff_match_patch();
+        const dict = new Map<string, string>();
+        const nextCodeRef = { value: 0xe000 };
+        const encLocal = this.encodeTokensWithDict(this.tokenizeForDiff(local), dict, nextCodeRef);
+        const encServer = this.encodeTokensWithDict(this.tokenizeForDiff(server), dict, nextCodeRef);
+        const diffs = dmp.diff_main(encLocal, encServer);
+        dmp.diff_cleanupSemantic(diffs);
+        let result = '';
+        let confLocal = '';
+        let confServer = '';
+        let inConflict = false;
+        const flush = () => {
+            if (!inConflict) return;
+            result += `<<<<<<< LOCAL\n${this.decodeEncoded(confLocal, dict)}\n=======\n${this.decodeEncoded(confServer, dict)}\n>>>>>>> SERVER\n`;
+            confLocal = '';
+            confServer = '';
+            inConflict = false;
+        };
+        for (const [op, data] of diffs) {
+            if (op === DIFF_EQUAL) {
+                flush();
+                result += this.decodeEncoded(data, dict);
+            } else if (op === DIFF_DELETE) {
+                inConflict = true;
+                confLocal += data;
+            } else if (op === DIFF_INSERT) {
+                inConflict = true;
+                confServer += data;
+            }
+        }
+        flush();
+        return result;
     }
 
     // 确保服务端存在分组目录：根据 groupPathSub 逐级创建缺失的分组
@@ -326,6 +428,19 @@ export class MirrorWorkspaceManager {
             progress?.report({ message: `同步目录 ${dir}` });
             const dirUri = vscode.Uri.joinPath(root, ...dir.split('/'));
             await this.ensureDir(dirUri);
+
+            // 写入分组元数据 .group.meta.json（仅在有分组子路径时）
+            const segs = dir.split('/').filter(Boolean);
+            const type = segs[0] as MagicResourceType;
+            const groupPathSub = segs.slice(1).join('/');
+            if (groupPathSub) {
+                try {
+                    const gmeta = await client.getGroupMetaByDir(dir);
+                    if (gmeta && typeof gmeta.path === 'string') {
+                        await this.writeLocalGroupMeta(root, type, groupPathSub, gmeta);
+                    }
+                } catch {}
+            }
 
             const files = await client.getResourceFiles(dir);
             for (const f of files) {
@@ -477,6 +592,8 @@ export class MirrorWorkspaceManager {
                     try {
                         const text = doc.getText();
                         const parsed = JSON.parse(text);
+                        // 忽略扩展字段：仅用于展示，不参与同步
+                        try { delete parsed.extra; } catch {}
                         // 校验元数据
                         const check = this.validateLocalMeta({ ...meta, ...parsed }, fileName);
                         if (!check.ok) {
@@ -763,6 +880,8 @@ export class MirrorWorkspaceManager {
 
                 // 忽略本地字段：不参与最终合并
                 try { delete finalMetaObj.localUpdateTime; } catch {}
+                // 忽略扩展字段：不参与最终合并与同步（服务端不接收）
+                try { delete finalMetaObj.extra; } catch {}
 
                 // 写入到本地 .meta.json 并更新时间戳
                 const existingMeta = await this.readLocalMeta(mirrorRoot, type, groupPathSub, fileName);
@@ -1123,9 +1242,8 @@ export class MirrorWorkspaceManager {
     public async promptCreateMirrorWorkspaceIfNeeded(client: MagicApiClient, serverConfig: MagicServerConfig): Promise<void> {
         const folders = vscode.workspace.workspaceFolders;
         const currentFolder = folders && folders.length > 0 ? folders[0].uri : null;
-        if (currentFolder) {
-            const isMirror = await this.isMirrorWorkspace(currentFolder);
-            if (isMirror) return;
+        if (!currentFolder || currentFolder.scheme !== "magic-api") {
+            return
         }
         const action = await vscode.window.showInformationMessage(
             '是否创建对应的本地镜像工作区以进行本地维护？',
@@ -1487,26 +1605,17 @@ export class MirrorWorkspaceManager {
         }
     }
 
-    // 打开差异/合并：优先使用 VS Code 内置 diff 展示差异，必要时回退到 Merge Editor
+    // 打开差异/合并：生成 token 级冲突文件并使用 Merge Editor 打开
     private async promptMergeForFile(fileName: string, dir: string, mirrorRoot: vscode.Uri): Promise<void> {
         // 本地与服务器脚本 URI
         const msUri = vscode.Uri.joinPath(mirrorRoot, ...dir.split('/'), `${fileName}.ms`);
         const serverUri = vscode.Uri.parse(`magic-api:/${dir}/${fileName}.ms`);
-
-        // 优先打开差异视图，高亮具体变更位置
-        try {
-            const title = `${fileName}.ms (本地 ↔ 服务器)`;
-            await vscode.commands.executeCommand('vscode.diff', msUri, serverUri, title);
-            return;
-        } catch {}
-
-        // 回退：构建冲突文件，并尝试使用 Merge Editor 打开
+        // 构建 token 级冲突文件，并尝试使用 Merge Editor 打开
         let localScript = '';
         let serverScript = '';
         try { localScript = Buffer.from(await vscode.workspace.fs.readFile(msUri)).toString('utf8'); } catch {}
         try { serverScript = Buffer.from(await vscode.workspace.fs.readFile(serverUri)).toString('utf8'); } catch {}
-        const normalize = (s: string) => s.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-        const conflict = `<<<<<<< LOCAL\n${normalize(localScript)}\n=======\n${normalize(serverScript)}\n>>>>>>> SERVER\n`;
+        const conflict = this.generateTokenConflict(localScript, serverScript);
 
         const tempBase = vscode.Uri.joinPath(mirrorRoot, '.merge', ...dir.split('/'));
         await this.ensureDir(tempBase);
@@ -1519,7 +1628,7 @@ export class MirrorWorkspaceManager {
         }
     }
 
-    // 打开元数据差异/合并：优先使用内置 diff，生成忽略本地字段的对比
+    // 打开元数据差异/合并：生成忽略本地字段的 token 级冲突文件，并使用 Merge Editor 打开
     private async promptMergeForMeta(fileName: string, dir: string, mirrorRoot: vscode.Uri): Promise<void> {
         const segs = dir.split('/');
         const type = segs[0] as MagicResourceType;
@@ -1538,33 +1647,15 @@ export class MirrorWorkspaceManager {
             }
         } catch {}
 
-        // 构建用于 diff 的净化副本：忽略本地字段（例如 localUpdateTime）
-        const sanitize = (m: MirrorFileMeta | null): any => {
-            const obj = { ...(m || { name: fileName, type, groupPath: dir }) } as any;
-            delete obj.localUpdateTime;
-            return obj;
-        };
-        const left = sanitize(localMeta);
-        const right = sanitize(serverMeta);
-
-        // 写入临时 diff 文件并打开差异视图
+        // 构建用于 diff 的净化副本：忽略本地字段与扩展字段
+        const leftObj = this.sanitizeMetaForDiff(localMeta) || { name: fileName, type, groupPath: dir };
+        const rightObj = this.sanitizeMetaForDiff(serverMeta) || { name: fileName, type, groupPath: dir };
+        const localJson = JSON.stringify(leftObj, null, 2);
+        const serverJson = JSON.stringify(rightObj, null, 2);
+        const conflict = this.generateTokenConflict(localJson, serverJson);
         const tempBase = vscode.Uri.joinPath(mirrorRoot, '.merge-meta', ...dir.split('/'));
         await this.ensureDir(tempBase);
-        const leftUri = vscode.Uri.joinPath(tempBase, `.${fileName}.local.meta.json`);
-        const rightUri = vscode.Uri.joinPath(tempBase, `.${fileName}.server.meta.json`);
-        await vscode.workspace.fs.writeFile(leftUri, Buffer.from(JSON.stringify(left, null, 2), 'utf8'));
-        await vscode.workspace.fs.writeFile(rightUri, Buffer.from(JSON.stringify(right, null, 2), 'utf8'));
-        try {
-            const title = `${fileName}.meta.json (本地 ↔ 服务器)`;
-            await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, title);
-            return;
-        } catch {}
-
-        // 回退：构建冲突 JSON 并尝试用 Merge Editor 打开
-        const localJson = JSON.stringify(left || {}, null, 2);
-        const serverJson = JSON.stringify(right || {}, null, 2);
-        const conflict = `<<<<<<< LOCAL\n${localJson}\n=======\n${serverJson}\n>>>>>>> SERVER\n`;
-        const tempUri = vscode.Uri.joinPath(tempBase, `.${fileName}.meta.json`);
+        const tempUri = vscode.Uri.joinPath(tempBase, `${fileName}.meta.json`);
         await vscode.workspace.fs.writeFile(tempUri, Buffer.from(conflict, 'utf8'));
         try {
             await vscode.commands.executeCommand('vscode.openWith', tempUri, 'mergeEditor');
@@ -1605,9 +1696,9 @@ export class MirrorWorkspaceManager {
     // 根据任意文件 URI 查找其所在镜像工作区根目录
     public async findMirrorRootForUri(uri: vscode.Uri): Promise<vscode.Uri | null> {
         if (uri.scheme !== 'file') return null;
-        // 自底向上查找 .magic-api-mirror.json
+        // 自底向上查找 .magic-api-mirror.json（限制最多向上3层）
         let current = uri;
-        const maxDepth = 10;
+        const maxDepth = 3;
         for (let i = 0; i < maxDepth; i++) {
             try {
                 const marker = vscode.Uri.joinPath(current, '.magic-api-mirror.json');
@@ -1624,12 +1715,39 @@ export class MirrorWorkspaceManager {
     // 扫描当前工作区，查找所有镜像根目录（支持镜像文件夹在工作区的子目录的场景）
     public async findAllMirrorRootsInWorkspace(): Promise<vscode.Uri[]> {
         const results: vscode.Uri[] = [];
-        try {
-            const files = await vscode.workspace.findFiles('**/.magic-api-mirror.json', '**/{node_modules,.git}/**');
-            for (const file of files) {
-                results.push(vscode.Uri.joinPath(file, '..'));
+        const folders = vscode.workspace.workspaceFolders || [];
+        const maxDepth = 3;
+        const skip = new Set(['node_modules', '.git', '.vscode', 'build', 'out', 'dist', 'target']);
+
+        const scanDir = async (base: vscode.Uri, depth: number): Promise<void> => {
+            if (depth > maxDepth) return;
+            try {
+                // 如果当前目录有标记文件则加入
+                const marker = vscode.Uri.joinPath(base, '.magic-api-mirror.json');
+                try {
+                    await vscode.workspace.fs.stat(marker);
+                    results.push(base);
+                    // 找到即可不再深入该分支
+                    return;
+                } catch {}
+
+                const entries = await vscode.workspace.fs.readDirectory(base);
+                for (const [name, type] of entries) {
+                    if (type === vscode.FileType.Directory) {
+                        if (skip.has(name)) continue;
+                        await scanDir(vscode.Uri.joinPath(base, name), depth + 1);
+                    } else if (type === vscode.FileType.File && name === '.magic-api-mirror.json') {
+                        results.push(base);
+                    }
+                }
+            } catch {
+                // 读取失败则忽略
             }
-        } catch {}
+        };
+
+        for (const folder of folders) {
+            await scanDir(folder.uri, 0);
+        }
         return results;
     }
 
@@ -1668,6 +1786,12 @@ export class MirrorWorkspaceManager {
         this.activeMirrorDisposables.delete(key);
     }
 
+    // 查询镜像根是否已连接（是否存在活动监听器）
+    public isMirrorRootConnected(root: vscode.Uri): boolean {
+        const arr = this.activeMirrorDisposables.get(root.fsPath);
+        return !!(arr && arr.length > 0);
+    }
+
     // 解析镜像工作区内文件的相对信息
     public parseMirrorFile(mirrorRoot: vscode.Uri, fileUri: vscode.Uri): { type: MagicResourceType | null; groupPathSub: string; fileName: string | null; typedPath: string | null } {
         const rel = fileUri.fsPath.replace(mirrorRoot.fsPath, '').replace(/^\\|\//, '').replace(/\\/g, '/');
@@ -1700,12 +1824,12 @@ export class MirrorWorkspaceManager {
         } else if (fileName && meta.name !== fileName) {
             errors.push(`name (${meta.name}) 与文件名 (${fileName}) 不一致`);
         }
-        // 针对 API：建议提供 method 与 requestMapping/path
+        // 针对 API：建议提供 method 与 requestMapping
         if (meta.type === 'api') {
-            const hasRoute = !!(meta.requestMapping || meta.path);
+            const hasRoute = !!meta.requestMapping;
             const hasMethod = !!meta.method;
             if (!hasMethod) errors.push('API 元数据缺少 method');
-            if (!hasRoute) errors.push('API 元数据缺少 requestMapping 或 path');
+            if (!hasRoute) errors.push('API 元数据缺少 requestMapping');
         }
         return { ok: errors.length === 0, errors };
     }

@@ -1,0 +1,320 @@
+# MAGIC API
+
+此项目是一个magic-script项目。将介绍语法与meta信息编写和修改
+
+注意：一个ms语法文件必须有相对应.语法文件.meta.json. 其内容根据不同类型有不同的字段，具体参考meta定义
+
+项目结构如下：
+api: 对外接口
+database: 数据库连接定义
+function: 对内方法，可使用`magic.invoke("方法路径")`直接调用或`import "@/path/functionName as test"`来导入并调用
+task: 定时任务。可在meta中指定cron来实现其定时调用。
+
+
+## 脚本语法（MagicScript）
+
+### 基础语法要点
+- 变量定义：`let x = 1;`
+- 条件：`if (...) { ... } else { ... }`
+- 循环：`for (r of rows) { ... }`
+- 函数调用：支持导入模块与函数、HTTP 调用、数据库操作。
+- 返回：脚本末尾表达式或 `return`。
+- 异常：`throw Error("message")`，结合统一异常处理可配置。
+
+### 模块导入与使用（示例）
+```magic
+import "@/common/encode/md5" as md5;
+let hash = md5("123456");
+return { ok: true, hash: hash };
+```
+
+### HTTP 调用（示例）
+```magic
+let resp = http.post("https://example.com/notify", { json: { event: "SYNC_DONE" } });
+if (resp.status != 200) {
+  throw Error("Notify failed: " + resp.status);
+}
+return resp.body;
+```
+
+### 数据库操作（示例）
+```magic
+let rows = db.common.query("select * from products where updated_at >= :ts", { ts: today() });
+for (let r of rows) {
+  return db.table('products').primary('id').save(r)
+}
+log.info("Synced rows: " + rows.length);
+return { synced: rows.length };
+```
+
+#### mybatis所有语法兼容
+例如
+```
+var sql = """
+select * from test_data
+	where 1 = 1
+	<if test="id == null">
+        and id = 0
+    </if>
+    <elseif test="id < 1000">
+        and id = #{id}
+    </elseif>
+"""
+return db.select(sql)
+```
+
+#### 单表crud接口（示例）
+操作入口：db.table('table_name')
+
+##### logic
+作用:设置本查询是带有逻辑删除的,在执行delete方法时，会转换为update语句，在执行select相关方法时，会拼接logic_field <> logic_value
+##### withBlank
+作用：设置后续插入或修改时，不过滤空值。
+##### column
+入参：column: String 列名
+作用：设置要查询列的,select语句中有效
+##### column
+入参：column: String 列名
+入参： value : Object 值
+作用：设置要操作的列的值,非select语句中有效
+##### primary
+入参：primary: String 主键
+入参：defaultValue: Object 插入时使用的默认值，可省略
+作用：设置主键列，在update中语句有效，或save方法判断标准
+##### insert
+入参: data : Map insert的列和值，可省略(通过column设置)
+// insert into sys_user(user_name,role) values('李富贵','admin')
+return db.table('sys_user').insert({ user_name : '李富贵', role : 'admin'})
+##### update
+入参: data : Map insert的列和值，可省略(通过column设置)
+// update sys_user set user_name = '王二狗' where id = 1
+return db.table('sys_user').primary('id').update({ id: 1, user_name : '王二狗'})
+##### save
+入参: data : Map insert或update的列和值，可省略(通过column设置)
+入参： beforeQuery ： boolean 是否根据id查询有没有数据，可省略(默认false)
+
+```js
+// insert into sys_user(id,user_name) values('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx','王二狗');
+return db.table('sys_user').primary('id', uuid()).save({user_name: '王二狗'});
+// insert into sys_user(user_name) values('王二狗');
+return db.table('sys_user').primary('id').save({user_name: '王二狗'});
+// update sys_user set user_name = '王二狗' where id = 1
+return db.table('sys_user').primary('id').save({id: 1,user_name: '王二狗'});
+#select
+查询list（与db.select 作用相同）
+// select * from sys_user
+return db.table('sys_user').select()
+#page
+分页查询（与db.page 作用相同）
+// select * from sys_user
+return db.table('sys_user').page()
+```
+##### where
+设置查询条件
+
+eq --> ==
+ne --> <>
+lt --> <
+gt --> >
+lte --> <=
+gte --> >=
+in --> in
+notIn --> not in
+like --> like
+notLike --> not like
+
+```
+// select * from sys_user where user_name like '%李富贵%' and role = 'admin'
+return db.table('sys_user')
+    .where()
+    .like('user_name','%李富贵%')
+    .eq('role','admin')
+    .select()
+```
+
+### 分页
+```
+// 自动从请求参数中获取页码(默认为page)、页大小(默认为size)
+return db.page("""
+    select * from sys_user
+""")
+```
+
+```
+return db.page("""
+    select * from sys_user
+""", 10, 20) // 跳过前20条查10条(limit, offset)
+```
+
+
+### 参数校验
+自动：
+需要在meta.json中配置对应的校验规则
+手动：
+- 语法：`exit code, message, data`（只取前三个值）；示例：`exit 400, "参数填写有误"`
+- 自动验证机制可在 UI 层进行配置并在脚本执行中生效。
+
+## meta.json定义
+
+### 整体约定
+- 文件命名：与 `.ms` 同名，隐藏前缀的元数据文件，形如 `.<文件名>.meta.json`。
+- 放置位置：位于镜像工作区的类型目录下（`api/`、`function/`、`datasource/`、`task/`）的对应分组路径内，与脚本文件同级。
+- 资源类型：`type` 取值为 `api | function | datasource | task`，必须与所在目录一致。
+- 分组路径：`groupPath` 必填，形如 `api/user`、`function/common/encode`，以资源类型为首段。
+- 同名约束：`name` 建议与 `.ms` 文件名一致（不含扩展名），客户端依据此规则定位元数据。
+- 服务端只读字段：`id`、`createBy`、`createTime`（epoch ms）、`updateTime`（epoch ms）、`locked` 由服务端生成/维护，不建议手工编辑。
+- 本地维护字段：`localUpdateTime`（epoch ms，本地保存时间戳），用于冲突检测，随保存更新，不会上传至服务端实体。
+- 透传扩展：未被客户端识别的字段统一收纳在 `extra` 对象中，原样保留与回传，便于与服务端版本兼容。
+
+### 字段说明（通用）
+- `id`: string，服务端资源唯一标识（只读，自动回写）。
+- `name`: string，资源名称（必填）。
+- `type`: string，资源类型枚举：`api | function | datasource | task`（必填）。
+- `groupPath`: string，分组路径（必填，首段必须是 `type`）。
+- `groupId`: string，可选，服务端分组 ID；未提供时由 `groupPath` 推导并在保存时确定。
+- `description`: string，可选，资源描述。
+- `locked`: boolean，只读，资源是否锁定。
+- `createBy`: string，只读，创建者。
+- `createTime`: number，epoch 毫秒，只读，创建时间。
+- `updateTime`: number，epoch 毫秒，只读，更新时间。
+- `localUpdateTime`: number，epoch 毫秒，仅本地使用，随保存更新。
+- `path`: string（函数），访问路径，仅用于 `function` 类型。
+- `requestMapping`: string（API），访问路径，仅用于 `api` 类型。
+- `method`: string（API），HTTP 方法，如 `GET`/`POST`/`PUT`/`DELETE` 等，建议使用大写。
+- `params`: array（API），请求参数定义，见下文详细结构。
+- `headers`: object | array（API），请求头定义。
+- `contentType`: string（API），请求/响应内容类型，典型值 `application/json`。
+- `timeout`: number（API），超时毫秒数。
+- `cron`: string（Task），Cron 表达式。
+- `enabled`: boolean（Task），是否启用该任务。
+- `executeOnStart`: boolean（Task），服务启动时是否立即执行一次。
+- `extra`: object，可选，透传服务端自定义字段容器。
+
+### 类型：api
+API 资源在 `.meta.json` 中需要至少提供 `method` 与 `requestMapping`。
+
+- `method`: HTTP 方法（必须）。
+- `requestMapping`: 访问路径（必须），如 `/user/list`。
+- `params`: 参数定义数组（可选，推荐）。每个元素建议包含：
+  - `name`: string（必填）参数名；
+  - `in`: string（可选）取值：`query | path | header | cookie | form | body | file`，默认 `query`；
+  - `type`: string（可选）取值：`string | number | boolean | date | array | object`；
+  - `required`: boolean（可选，默认 false）；
+  - `default`: any（可选）；
+  - `description`: string（可选）；
+  - `examples`: any（可选）；
+  - `constraints`: object（可选）用于自动校验，示例键：`required`、`minLength`、`maxLength`、`pattern`、`min`、`max`、`enum` 等；
+  - 其他字段：原样透传给服务端。
+- `headers`: 两种形态均被支持：
+  - 对象：`{"Authorization": "Bearer ${token}"}`；
+  - 数组：`[{ "name": "Authorization", "value": "Bearer ${token}", "required": true, "description": "认证凭证" }]`。
+- `contentType`: 常用 `application/json`，也可按需指定。
+- `timeout`: 毫秒值，用于请求超时控制。
+
+示例（API）：
+```json
+{
+  "id": "srv-1234567890",
+  "type": "api",
+  "groupPath": "api/user",
+  "name": "list",
+  "method": "GET",
+  "requestMapping": "/user/list",
+  "description": "用户列表查询",
+  "params": [
+    { "name": "page", "in": "query", "type": "number", "default": 1, "constraints": { "min": 1 } },
+    { "name": "size", "in": "query", "type": "number", "default": 20, "constraints": { "min": 1, "max": 200 } },
+    { "name": "keyword", "in": "query", "type": "string", "required": false, "constraints": { "maxLength": 64 } }
+  ],
+  "headers": { "Authorization": "Bearer ${token}" },
+  "contentType": "application/json",
+  "timeout": 30000,
+  "localUpdateTime": 1720000000000,
+  "extra": {}
+}
+```
+
+### 类型：function
+函数资源用于在脚本内通过 `magic.invoke("/path/to/fn")` 或 `import "@/path/to/fn" as alias` 调用。
+
+- `path`: 函数路径（必须），如 `/common/encode/md5`。
+- 不使用 `method`、`headers`、`contentType`、`timeout`（HTTP 相关字段对函数无效）。
+- 可选 `description`。
+
+示例（函数）：
+```json
+{
+  "type": "function",
+  "groupPath": "function/common/encode",
+  "name": "md5",
+  "path": "/common/encode/md5",
+  "description": "MD5 编码函数"
+}
+```
+
+### 类型：task
+任务资源通过 Cron 表达式定义调度行为。
+
+- `cron`: string（必须），如 `0 0/5 * * * ?` 表示每 5 分钟执行一次。
+- `enabled`: boolean（可选），是否启用；
+- `executeOnStart`: boolean（可选），服务启动时是否立即执行；
+- 可选 `description`。
+
+示例（任务）：
+```json
+{
+  "type": "task",
+  "groupPath": "task/maintenance",
+  "name": "clearCache",
+  "cron": "0 0/5 * * * ?",
+  "enabled": true,
+  "executeOnStart": false,
+  "description": "定时清理缓存以保持数据新鲜"
+}
+```
+
+### 类型：datasource
+数据源资源用于数据库连接等后端能力管理。当前客户端以只读展示为主：
+
+- 通用字段：`name`、`type`（=`datasource`）、`groupPath`、`description` 可维护；
+- 连接配置字段通常由服务端统一管理（例如驱动、URL、账号、池配置等）；
+- 未识别的服务端扩展字段会保留在 `extra` 中；
+- 通过镜像工作区直接新建/修改数据源连接在某些服务端版本上可能不生效（客户端在保存时仅提交通用字段）。
+
+示例（数据源）：
+```json
+{
+  "type": "datasource",
+  "groupPath": "datasource/common",
+  "name": "dbCommon",
+  "description": "公共数据库连接占位，连接细节由服务端管理",
+  "extra": {}
+}
+```
+
+### 文件命名与路径规则
+- 虚拟文档路径（只读预览）：`magic-api:{type}/{groupPathSub}/{name}.ms`。
+- 镜像工作区路径（本地文件）：`{mirrorRoot}/{type}/{groupPathSub}/{name}.ms`。
+- 元数据文件：`{mirrorRoot}/{type}/{groupPathSub}/.{name}.meta.json`。
+- `groupPathSub` 为去掉首段 `type` 后的剩余路径片段。
+
+### 校验与保存行为
+- 客户端校验：
+  - `type`、`groupPath`、`name` 必填；
+  - API 必须提供 `method` 与 `requestMapping`；
+  - 函数必须提供 `path`；
+  - 任务必须提供 `cron`，并校验布尔字段；
+  - 数据源类型仅做通用字段校验；
+- 保存到服务端的字段映射：
+  - API：`requestMapping`、`method`、`params`、`headers`、`contentType`、`timeout`；
+  - Function：`path`；
+  - Task：`cron`、`enabled`、`executeOnStart`；
+  - Datasource：仅通用字段（`name`、`description`、分组信息等），客户端不构造连接专有字段；
+- 时间戳：`createTime`/`updateTime` 由服务端回写；`localUpdateTime` 仅用于本地。
+- 透传：未识别字段放入 `extra` 原样保留，便于服务端自定义扩展与版本兼容。
+
+### 与参数校验的协同
+- 若在 `params` 中为 API 参数提供 `constraints`，则在启用自动校验的场景下由客户端/服务端协同执行校验；
+- 手动校验仍可通过脚本中的 `exit code, message` 流程中断并返回错误；
+- 建议在 `constraints` 中统一使用语义化键，以提升可读性与跨版本兼容性。
+

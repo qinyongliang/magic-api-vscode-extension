@@ -1,5 +1,9 @@
 import * as vscode from 'vscode';
 import { RemoteLspClient } from './remoteLspClient';
+import { ServerManager } from './serverManager';
+import { MagicFileInfo } from './magicFileSystemProvider';
+import { MirrorWorkspaceManager } from './mirrorWorkspaceManager';
+import { MAGIC_RESOURCE_TYPES, MagicResourceType } from './types';
 
 // 简单关键字列表（来源于 tmLanguage 语法定义）
 const MAGIC_KEYWORDS = [
@@ -202,8 +206,8 @@ function provideDocumentSymbols(remote: RemoteLspClient, document: vscode.TextDo
         );
         symbols.push(ds);
     }
-    // 语言块 ```lang
-    const blockRegex = /```([A-Za-z_][A-Za-z0-9_]*)/g;
+    // 语言块 """lang
+    const blockRegex = /"""([A-Za-z_][A-Za-z0-9_]*)/g;
     for (let line = 0; line < document.lineCount; line++) {
         const text = document.lineAt(line).text;
         let m: RegExpExecArray | null;
@@ -225,6 +229,218 @@ function provideDocumentSymbols(remote: RemoteLspClient, document: vscode.TextDo
     return symbols;
 }
 
+// 使用 URL 作为工作区符号名称（服务器文件信息）
+function buildUrlSymbolName(file: MagicFileInfo): string {
+    const type = file.type || ('api' as any);
+    if (type === 'api') {
+        const p0 = file.requestMapping || file.path || `/${file.name}`;
+        const p = p0.startsWith('/') ? p0 : '/' + p0;
+        return `#${p}`;
+    }
+    const p1 = file.path || `/${file.name}`;
+    const p2 = p1.startsWith('/') ? p1 : '/' + p1;
+    return `#${p2}`;
+}
+
+// 使用 URL 作为工作区符号名称（本地镜像 meta）
+function buildUrlSymbolNameFromLocal(meta: { type?: string; requestMapping?: string; path?: string; name?: string }): string {
+    const type = meta.type || 'api';
+    if (type === 'api') {
+        const p0 = meta.requestMapping || meta.path || `/${meta.name || ''}`;
+        const p = p0.startsWith('/') ? p0 : '/' + p0;
+        return `#${p}`;
+    }
+    const p1 = meta.path || `/${meta.name || ''}`;
+    const p2 = p1.startsWith('/') ? p1 : '/' + p1;
+    return `#${p2}`;
+}
+
+// 读取某镜像文件的本地元数据 .meta.json
+async function readLocalMeta(root: vscode.Uri, type: MagicResourceType, groupPathSub: string | undefined, fileName: string): Promise<any | null> {
+    const dirUri = vscode.Uri.joinPath(root, type, ...(groupPathSub ? groupPathSub.split('/') : []));
+    const metaName = `.${fileName}.meta.json`;
+    const metaUri = vscode.Uri.joinPath(dirUri, metaName);
+    try {
+        const buf = await vscode.workspace.fs.readFile(metaUri);
+        const text = Buffer.from(buf).toString('utf8');
+        const obj = JSON.parse(text);
+        return obj;
+    } catch {
+        return null;
+    }
+}
+
+// 读取某分组目录的分组元数据 .group.meta.json
+async function readLocalGroupMeta(root: vscode.Uri, type: MagicResourceType, groupPathSub: string | undefined): Promise<any | null> {
+    const dirUri = vscode.Uri.joinPath(root, type, ...(groupPathSub ? groupPathSub.split('/') : []));
+    const metaUri = vscode.Uri.joinPath(dirUri, '.group.meta.json');
+    try {
+        const buf = await vscode.workspace.fs.readFile(metaUri);
+        const text = Buffer.from(buf).toString('utf8');
+        const obj = JSON.parse(text);
+        return obj;
+    } catch {
+        return null;
+    }
+}
+
+// 列出某镜像根目录的所有 .ms 文件
+async function listLocalMsFiles(root: vscode.Uri): Promise<Array<{ type: MagicResourceType; dir: string; groupPathSub: string; fileName: string }>> {
+    const result: Array<{ type: MagicResourceType; dir: string; groupPathSub: string; fileName: string }> = [];
+    for (const t of MAGIC_RESOURCE_TYPES) {
+        const tRoot = vscode.Uri.joinPath(root, t);
+        let entries: [string, vscode.FileType][] = [];
+        try { entries = await vscode.workspace.fs.readDirectory(tRoot); } catch { continue; }
+        const stack: { base: vscode.Uri; segs: string[] }[] = [{ base: tRoot, segs: [] }];
+        while (stack.length) {
+            const cur = stack.pop()!;
+            let items: [string, vscode.FileType][] = [];
+            try { items = await vscode.workspace.fs.readDirectory(cur.base); } catch { continue; }
+            for (const [name, ft] of items) {
+                if (ft === vscode.FileType.Directory) {
+                    stack.push({ base: vscode.Uri.joinPath(cur.base, name), segs: [...cur.segs, name] });
+                } else if (ft === vscode.FileType.File && name.endsWith('.ms')) {
+                    const fileName = name.replace(/\.ms$/, '');
+                    const groupPathSub = cur.segs.join('/');
+                    const dir = `${t}${groupPathSub ? '/' + groupPathSub : ''}`;
+                    result.push({ type: t, dir, groupPathSub, fileName });
+                }
+            }
+        }
+    }
+    return result;
+}
+
+// 本地镜像工作区符号缓存与监听器
+const mirrorSymbolsCache = new Map<string, { symbols: vscode.SymbolInformation[]; namesLower: string[] }>();
+const mirrorRootWatchers = new Map<string, vscode.FileSystemWatcher>();
+
+// 重建某镜像根目录下的本地工作区符号缓存
+async function rebuildLocalSymbolsForRoot(root: vscode.Uri): Promise<void> {
+    const files = await listLocalMsFiles(root);
+    const symbols: vscode.SymbolInformation[] = [];
+    const namesLower: string[] = [];
+    for (const f of files) {
+        const meta = await readLocalMeta(root, f.type, f.groupPathSub, f.fileName);
+        // 递归读取分组 .group.meta.json，构建 URL 前缀
+        let prefixSegs: string[] = [];
+        if (f.groupPathSub) {
+            const segParts = f.groupPathSub.split('/').filter(Boolean);
+            for (let i = 1; i <= segParts.length; i++) {
+                const cur = segParts.slice(0, i).join('/');
+                const gmeta = await readLocalGroupMeta(root, f.type, cur);
+                const gp = gmeta?.path;
+                if (gp && typeof gp === 'string') {
+                    const cleaned = gp.replace(/^\/+/,'').replace(/\/+$/,'');
+                    if (cleaned) prefixSegs.push(cleaned);
+                }
+            }
+        }
+        const prefix = prefixSegs.join('/');
+
+        const groupPath = meta?.groupPath || f.dir; // 保持容器名
+        const baseName = meta?.name ?? f.fileName;
+        let leafRaw: string;
+        if (f.type === 'api') {
+            const p0 = meta?.requestMapping || meta?.path || `/${baseName}`;
+            leafRaw = p0.startsWith('/') ? p0.substring(1) : p0;
+        } else {
+            const p1 = meta?.path || `/${baseName}`;
+            leafRaw = p1.startsWith('/') ? p1.substring(1) : p1;
+        }
+        const urlPath = '/' + [prefix, leafRaw].filter(Boolean).join('/');
+        const name = `#${urlPath}`;
+        const segs = f.dir.split('/').filter(Boolean);
+        const fileUri = vscode.Uri.joinPath(root, ...segs, `${f.fileName}.ms`);
+        const location = new vscode.Location(fileUri, new vscode.Position(0, 0));
+        const kind = vscode.SymbolKind.Function;
+        const containerName = groupPath;
+        symbols.push(new vscode.SymbolInformation(name, kind, containerName, location));
+        namesLower.push(urlPath.replace(/^\//, '').toLowerCase());
+    }
+    mirrorSymbolsCache.set(root.toString(), { symbols, namesLower });
+}
+
+// 刷新镜像根目录与监听器，并确保初次构建缓存
+async function refreshMirrorRoots(context: vscode.ExtensionContext): Promise<vscode.Uri[]> {
+    const mm = MirrorWorkspaceManager.getInstance(context);
+    const roots = await mm.findAllMirrorRootsInWorkspace();
+    const active = new Set(roots.map(r => r.toString()));
+
+    // 清理已移除的根的监听与缓存
+    for (const [key, watcher] of mirrorRootWatchers) {
+        if (!active.has(key)) {
+            try { watcher.dispose(); } catch {}
+            mirrorRootWatchers.delete(key);
+            mirrorSymbolsCache.delete(key);
+        }
+    }
+
+    // 为新根创建监听并构建缓存
+    for (const root of roots) {
+        const key = root.toString();
+        if (!mirrorRootWatchers.has(key)) {
+            const pattern = new vscode.RelativePattern(root, '**/.*.meta.json');
+            const watcher = vscode.workspace.createFileSystemWatcher(pattern);
+            watcher.onDidCreate(async () => { try { await rebuildLocalSymbolsForRoot(root); } catch {} });
+            watcher.onDidChange(async () => { try { await rebuildLocalSymbolsForRoot(root); } catch {} });
+            watcher.onDidDelete(async () => { try { await rebuildLocalSymbolsForRoot(root); } catch {} });
+            mirrorRootWatchers.set(key, watcher);
+        }
+        if (!mirrorSymbolsCache.has(key)) {
+            try { await rebuildLocalSymbolsForRoot(root); } catch {}
+        }
+    }
+    return roots;
+}
+
+async function provideWorkspaceSymbolsLocal(context: vscode.ExtensionContext, remote: RemoteLspClient, query: string): Promise<vscode.SymbolInformation[] | undefined> {
+    const q = (query || '').trim();
+    if (!q) return [];
+
+    // 优先：镜像工作区使用本地缓存（监听 .meta.json 变更即时更新）
+    const roots = await refreshMirrorRoots(context);
+    if (roots.length > 0) {
+        const kw = q.replace(/^#/, '').toLowerCase();
+        const out: vscode.SymbolInformation[] = [];
+        for (const root of roots) {
+            const idx = mirrorSymbolsCache.get(root.toString());
+            if (!idx) continue;
+            for (let i = 0; i < idx.symbols.length; i++) {
+                if (kw && !idx.namesLower[i].includes(kw)) continue;
+                out.push(idx.symbols[i]);
+            }
+        }
+        return out;
+    }
+
+    // 远程工作区：若远程 LSP 已跑，避免重复（让远程 LSP 接管）；否则调用服务器 /workbench/search
+    if (remote.isRunning()) return undefined;
+    const client = ServerManager.getInstance().getCurrentClient();
+    if (!client) return [];
+    const kw = q.replace(/^#/, '');
+    let results: Array<{ id: string; text: string; line: number }> = [];
+    try { results = await (client as any).searchWorkbench(kw); } catch {}
+    const symbols: vscode.SymbolInformation[] = [];
+    for (const r of results) {
+        const finfo: MagicFileInfo | null = await client.getFile(String(r.id));
+        if (!finfo) continue;
+        const type = finfo.type || ('api' as any);
+        const gpRaw = (finfo.groupPath || '').replace(/^\/+/, '');
+        const gp = gpRaw ? gpRaw : '';
+        const fullDir = gp ? (gp.startsWith(`${type}/`) ? gp : `${type}/${gp}`) : `${type}`;
+        const typedPath = `${fullDir}/${finfo.name}.ms`;
+        const uri = vscode.Uri.parse(`magic-api:/${typedPath}`);
+        const line = Math.max(0, Number(r.line || 0) - 1);
+        const location = new vscode.Location(uri, new vscode.Position(line, 0));
+        const name = buildUrlSymbolName(finfo);
+        const kind = vscode.SymbolKind.Function;
+        const containerName = finfo.groupPath || type;
+        symbols.push(new vscode.SymbolInformation(name, kind, containerName, location));
+    }
+    return symbols;
+}
+
 export function registerLocalLanguageFeatures(context: vscode.ExtensionContext, remoteClient: RemoteLspClient): vscode.Disposable[] {
     const disposables: vscode.Disposable[] = [];
     // 监听镜像元数据变更，更新工作台缓存
@@ -233,6 +449,11 @@ export function registerLocalLanguageFeatures(context: vscode.ExtensionContext, 
     watcher.onDidChange(async (uri) => { try { const wb = await readWorkbenchFromMirrorMeta(uri); if (wb) workbenchCache.set(uri.toString(), wb); } catch {} });
     watcher.onDidDelete((uri) => { workbenchCache.delete(uri.toString()); });
     disposables.push(watcher);
+
+    // 初始化镜像根监听与本地符号缓存
+    refreshMirrorRoots(context).then(() => {
+        for (const [, w] of mirrorRootWatchers) disposables.push(w);
+    }).catch(() => {});
 
     // 补全
     disposables.push(
@@ -279,6 +500,13 @@ export function registerLocalLanguageFeatures(context: vscode.ExtensionContext, 
     disposables.push(
         vscode.languages.registerDocumentSymbolProvider({ language: 'magic-script', scheme: 'magic-api' }, {
             provideDocumentSymbols(doc) { return provideDocumentSymbols(remoteClient, doc); }
+        })
+    );
+
+    // 工作区符号（镜像工作区本地化；否则远程/服务器）
+    disposables.push(
+        vscode.languages.registerWorkspaceSymbolProvider({
+            async provideWorkspaceSymbols(query: string) { return await provideWorkspaceSymbolsLocal(context, remoteClient, query); }
         })
     );
 

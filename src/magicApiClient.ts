@@ -19,7 +19,7 @@ export interface MagicServerConfig {
 export interface CreateFileRequest {
     name: string;
     script: string;
-    // 统一资源保存支持按目录路径定位分组
+    // 例如: "api/user" 或 "function/util"
     groupPath?: string; // 例如: "api/user" 或 "function/util"
     groupId?: string | null; // 兼容旧接口，优先使用 groupPath
     type: MagicResourceType;
@@ -35,6 +35,22 @@ export interface CreateGroupRequest {
     description?: string;
 }
 
+// 原始分组导出结构（用于写入 .group.meta.json）
+export interface MagicGroupMetaRaw {
+    properties?: Record<string, any>;
+    id?: string;
+    name?: string;
+    type?: MagicResourceType | string;
+    parentId?: string;
+    path?: string; // 分组 URL 路由片段（可能带前导 /）
+    createTime?: number;
+    updateTime?: number;
+    createBy?: string;
+    updateBy?: string;
+    paths?: any[];
+    options?: any[];
+}
+
 export class MagicApiClient {
     private exposeHeaders: string = 'magic-token';
     private httpClient: any;
@@ -45,667 +61,352 @@ export class MagicApiClient {
     private loginInFlight?: Promise<string | null>;
 
     constructor(private config: MagicServerConfig) {
-        // 读取可配置的接口前缀
-        const cfg = vscode.workspace.getConfiguration('magicApi');
-        this.webPrefix = cfg.get<string>('webPrefix', '/magic/web');
-        
+        const base = new URL(config.url);
+        const basePath = base.pathname.replace(/\/$/, '');
+        this.webPrefix = `${base.origin}${basePath}`;
         this.httpClient = axios.create({
-            baseURL: config.url,
-            timeout: 30000,
+            baseURL: this.webPrefix,
+            timeout: 15000,
             headers: {
                 'Content-Type': 'application/json'
             }
         });
-
-        debug(`MagicApiClient init: baseURL=${config.url}, webPrefix=${this.webPrefix}, lspPort=${config.lspPort || 8081}, debugPort=${config.debugPort || 8082}`);
-
-        // 设置认证：优先使用 magic-token 头
-        if (config.token) {
-            this.httpClient.defaults.headers.common[this.exposeHeaders] = config.token;
-        } else if (config.username && config.password) {
-            this.httpClient.defaults.auth = {
-                username: config.username,
-                password: config.password
-            };
-        }
-
-        // 请求拦截：若已有令牌则自动附加 Authorization
-        this.httpClient.interceptors.request.use(
-            (cfg: any) => {
-                const token = this.sessionToken || this.config.token;
-                if (token) {
-                    cfg.headers = cfg.headers || {};
-                    // 统一使用 magic-token 头；同时附带大小写变体以提升兼容性
-                    if (!cfg.headers['magic-token']) cfg.headers['magic-token'] = token;
-                    if (!cfg.headers['Magic-Token']) cfg.headers['Magic-Token'] = token;
-                }
-                return cfg;
-            },
-            (err: any) => Promise.reject(err)
-        );
-
-        // 响应拦截器：同时在成功分支与错误分支处理鉴权失效（code=401 或消息提示）并自动登录重试
-        this.httpClient.interceptors.response.use(
-            async (response: any) => {
-                try {
-                    const body =  response?.data;
-                    const code = typeof body?.code !== 'undefined' ? body.code : undefined;
-                    const message = body?.message || '';
-                    const path = response?.config?.url;
-
-                    const isTokenInvalid = code === 401 || /token无效/i.test(String(message));
-                    if (isTokenInvalid && response?.config && !response.config._retry) {
-                        response.config._retry = true;
-                        debug(`HTTP 200 但业务码为401/token无效: url=${path ?? 'n/a'}，尝试自动登录并重试`);
-                        const token = await this.ensureLogin();
-                        if (token) {
-                            response.config.headers = response.config.headers || {};
-                            response.config.headers[this.exposeHeaders] = token;
-                            try {
-                                return await this.httpClient.request(response.config);
-                            } catch (retryErr: any) {
-                                const rStatus = retryErr?.response?.status;
-                                debug(`重试失败: status=${rStatus ?? 'n/a'} url=${path ?? 'n/a'} message=${retryErr?.message}`);
-                                vscode.window.showErrorMessage(`请求重试失败: ${retryErr?.message}`);
-                                return Promise.reject(retryErr);
-                            }
-                        }
-                    }
-                } catch (e) {
-                    // 安全兜底：若解析失败则直接返回原响应
-                }
-                return response;
-            },
-            (error: any) => error
-        )
+        this.httpClient.interceptors.request.use((cfg: any) => {
+            const tok = this.sessionToken || this.config.token;
+            if (tok) {
+                cfg.headers = cfg.headers || {};
+                cfg.headers[this.exposeHeaders] = tok;
+            }
+            return cfg;
+        });
+        this.httpClient.interceptors.response.use((resp: any) => resp, (err: any) => {
+            if (err?.response?.status === 401) {
+                this.sessionToken = undefined;
+            }
+            throw err;
+        });
     }
 
-    // 暴露 WS/HTTP 通用认证头（用于 WebSocket 握手传递）
     getAuthHeaders(): Record<string, string> {
-        const headers: Record<string, string> = {};
-        const token = this.sessionToken || this.config.token;
-        if (token) {
-            headers['magic-token'] = token;
-            headers['Magic-Token'] = token;
-            return headers;
-        }
-        if (this.config.username && this.config.password) {
-            // 某些后端可能在 WS 握手阶段不支持 Basic，这里仅在无 token 时尝试提供
-            const basic = Buffer.from(`${this.config.username}:${this.config.password}`, 'utf8').toString('base64');
-            headers['Authorization'] = `Basic ${basic}`;
-        }
-        return headers;
+        const tok = this.sessionToken || this.config.token;
+        return tok ? { [this.exposeHeaders]: tok } : {};
     }
 
-    // 确保已登录（有令牌），避免重复登录
-    private async ensureLogin(): Promise<string | null> {
-        if (this.sessionToken || this.config.token) {
-            return this.sessionToken ?? this.config.token ?? null;
-        }
-        if (!this.loginInFlight) {
-            this.loginInFlight = this.login();
-        }
-        const token = await this.loginInFlight;
+    async ensureLogin(): Promise<string | null> {
+        if (this.sessionToken) return this.sessionToken;
+        if (this.loginInFlight) return this.loginInFlight;
+        this.loginInFlight = this.login();
+        const tok = await this.loginInFlight.catch(() => null);
         this.loginInFlight = undefined;
-        return token;
+        return tok;
     }
 
-    // 使用用户名密码自动登录并获取令牌（兼容多种返回结构与路径）
     private async login(): Promise<string | null> {
-        const { username, password } = this.config;
-        if (!username || !password) {
-            debug('未配置用户名/密码，无法自动登录获取令牌');
+        try {
+            const { username, password } = this.config;
+            if (!username || !password) return null;
+            const resp = await this.httpClient.post('/login', { username, password });
+            const tok = resp?.data?.data?.token || resp?.data?.token || resp?.headers?.[this.exposeHeaders];
+            if (tok) this.sessionToken = tok;
+            return tok || null;
+        } catch (e) {
+            logError(`Login failed: ${String(e)}`);
             return null;
         }
-        try {
-            const axiosClient = axios.create({
-                baseURL: this.httpClient.getUri(),
-                timeout: 3000,
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                },
-            });
-            const resp = await axiosClient.post(`${this.webPrefix}/login`, `username=${username}&password=${password}`);
-            this.exposeHeaders = (resp.headers['access-control-expose-headers'] || '').toLowerCase();
-            const token = resp.headers[this.exposeHeaders] 
-            if (typeof token === 'string' && token.length > 0) {
-                this.sessionToken = token;
-                this.httpClient.defaults.headers.common[this.exposeHeaders] = token;
-                debug(`登录成功，令牌已更新并附加到请求头: ${this.exposeHeaders}`);
-                return token;
+    }
+
+    async getGroups(type: MagicResourceType): Promise<MagicGroupInfo[]> {
+        const resp = await this.httpClient.post('/resource');
+        const tree = resp?.data?.data || {};
+        const root = tree[type];
+        if (!root) return [];
+        const groups: MagicGroupInfo[] = [];
+        const queue: any[] = [root];
+        while (queue.length) {
+            const cur = queue.shift();
+            const n = cur.node || {};
+            const isGroup = n && (typeof n.parentId !== 'undefined' || typeof n.type !== 'undefined');
+            if (isGroup) {
+                const id = String(n.id || '');
+                const name = String(n.name || '');
+                const path = this.buildPathFromNode(root, id);
+                const info: MagicGroupInfo = {
+                    id,
+                    name,
+                    path,
+                    parentId: n.parentId ? String(n.parentId) : undefined,
+                    type: (n.type || type) as MagicResourceType,
+                };
+                groups.push(info);
+                if (id) {
+                    this.pathToIdCache.set(`${type}/${path}`, id);
+                    this.idToPathCache.set(id, `${type}/${path}`);
+                }
             }
-        } catch (e: any) {
-            debug(`登录失败 : ${String(e?.message || e)}`);
+            const children: any[] = cur.children || [];
+            for (const child of children) queue.push(child);
         }
-        vscode.window.showErrorMessage('自动登录失败：未能获取令牌');
+        return groups;
+    }
+
+    async getGroup(groupId: string): Promise<MagicGroupInfo | null> {
+        const resp = await this.httpClient.post('/resource');
+        const tree = resp?.data?.data || {};
+        const typeKeys = Object.keys(tree);
+        for (const type of typeKeys) {
+            const root = tree[type];
+            const node = this.findGroupNodeById(root, groupId);
+            if (node) {
+                const n = node.node || {};
+                const id = String(n.id || '');
+                const name = String(n.name || '');
+                const path = this.buildPathFromNode(root, id);
+                const info: MagicGroupInfo = {
+                    id,
+                    name,
+                    path,
+                    parentId: n.parentId ? String(n.parentId) : undefined,
+                    type: (n.type || type) as MagicResourceType,
+                };
+                return info;
+            }
+        }
         return null;
     }
 
-    // 获取所有分组
-    async getGroups(type: MagicResourceType): Promise<MagicGroupInfo[]> {
-        try {
-            // 通过统一资源树解析分组列表并填充缓存
-            const urlPath = `${this.webPrefix}/resource`;
-            debug(`GetGroups: baseURL=${this.config.url} path=${urlPath} type=${type}`);
-            const response = await this.httpClient.post(urlPath);
-            const tree: any = response.data?.data || {};
+    async getFiles(type: MagicResourceType, groupId: string | null): Promise<MagicFileInfo[]> {
+        const resp = await this.httpClient.post('/resource');
+        const tree = resp?.data?.data || {};
+        const root = tree[type];
+        if (!root) return [];
+        let target: any = null;
+        if (groupId) {
+            target = this.findGroupNodeById(root, groupId);
+        } else {
+            target = root;
+        }
+        if (!target) return [];
+        const files: MagicFileInfo[] = [];
+        const children: any[] = target.children || [];
+        for (const child of children) {
+            const n = child.node || {};
+            const isFile = n && typeof n.script === 'string';
+            if (isFile) {
+                const info: MagicFileInfo = {
+                    id: String(n.id || ''),
+                    name: String(n.name || ''),
+                    type: type,
+                    groupId: String(n.groupId || ''),
+                    groupPath: `${type}/${this.buildPathFromNode(root, String(n.groupId || ''))}`,
+                    path: String(n.path || ''),
+                    requestMapping: String(n.requestMapping || ''),
+                    method: String(n.method || ''),
+                    description: String(n.description || ''),
+                    script: String(n.script || ''),
+                };
+                files.push(info);
+                if (info.id) this.idToPathCache.set(info.id, `${info.groupPath}/${info.name}.ms`);
+            }
+        }
+        return files;
+    }
+
+    async getFile(fileId: string): Promise<MagicFileInfo | null> {
+        const resp = await this.httpClient.post('/resource');
+        const tree = resp?.data?.data || {};
+        const typeKeys = Object.keys(tree);
+        for (const type of typeKeys) {
             const root = tree[type];
-            if (!root) return [];
-            const groups: MagicGroupInfo[] = [];
             const queue: any[] = [root];
             while (queue.length) {
                 const cur = queue.shift();
                 const n = cur.node || {};
-                const isGroup = n && (typeof n.parentId !== 'undefined' || typeof n.type !== 'undefined');
-                if (isGroup && n.id && n.id !== '0') {
-                    const path = this.buildPathFromNode(root, n.id);
-                    const info: MagicGroupInfo = {
-                        id: n.id,
-                        name: n.name,
-                        path,
-                        parentId: n.parentId,
-                        type,
-                        createTime: n.createTime,
-                        updateTime: n.updateTime,
-                    };
-                    groups.push(info);
-                    this.pathToIdCache.set(`${type}/${path}`, n.id);
-                    this.idToPathCache.set(n.id, `${type}/${path}`);
-                }
-                for (const child of (cur.children || [])) queue.push(child);
-            }
-            return groups;
-        } catch (error) {
-            logError(`获取分组失败: ${String(error)}`);
-            return [];
-        }
-    }
-
-    // 获取分组信息
-    async getGroup(groupId: string): Promise<MagicGroupInfo | null> {
-        try {
-            // 通过资源树查找分组
-            const treeResp = await this.httpClient.post(`${this.webPrefix}/resource`);
-            const tree: any = treeResp.data?.data || {};
-            for (const type of Object.keys(tree)) {
-                const found = this.findGroupNodeById(tree[type], groupId);
-                if (found) {
-                    const n = found.node || {};
-                    const path = this.buildPathFromNode(tree[type], groupId);
-                    const info: MagicGroupInfo = {
-                        id: n.id,
-                        name: n.name,
-                        path,
-                        parentId: n.parentId,
-                        type: type as MagicResourceType,
-                        createTime: n.createTime,
-                        updateTime: n.updateTime,
+                if (n && String(n.id || '') === String(fileId || '')) {
+                    const info: MagicFileInfo = {
+                        id: String(n.id || ''),
+                        name: String(n.name || ''),
+                        type: (n.type || type) as MagicResourceType,
+                        groupId: String(n.groupId || ''),
+                        groupPath: `${type}/${this.buildPathFromNode(root, String(n.groupId || ''))}`,
+                        path: String(n.path || ''),
+                        requestMapping: String(n.requestMapping || ''),
+                        method: String(n.method || ''),
+                        description: String(n.description || ''),
+                        script: String(n.script || ''),
                     };
                     return info;
                 }
+                const children: any[] = cur.children || [];
+                for (const child of children) queue.push(child);
             }
-            return null;
-        } catch (error) {
-            logError(`获取分组信息失败: ${String(error)}`);
-            return null;
         }
+        return null;
     }
 
-    // 获取文件列表
-    async getFiles(type: MagicResourceType, groupId: string | null): Promise<MagicFileInfo[]> {
-        try {
-            // 通过资源树解析指定分组的文件列表
-            const treeResp = await this.httpClient.post(`${this.webPrefix}/resource`);
-            const tree: any = treeResp.data?.data || {};
-            const root = tree[type];
-            if (!root || !groupId) return [];
-            const groupNode = this.findGroupNodeById(root, groupId);
-            if (!groupNode) return [];
-            const dir = this.buildPathFromNode(root, groupId);
-            const files: MagicFileInfo[] = [];
-            const children: any[] = groupNode.children || [];
-            for (const child of children) {
-                const n = child.node || {};
-                const isFile = n && typeof n.groupId !== 'undefined' && typeof n.type === 'undefined';
-                if (isFile) {
-                    const info: MagicFileInfo = {
-                        id: n.id,
-                        name: n.name,
-                        path: n.path || '',
-                        script: '',
-                        groupId: n.groupId,
-                        groupPath: dir,
-                        type,
-                        createTime: n.createTime,
-                        updateTime: n.updateTime,
-                        createBy: n.createBy,
-                        updateBy: n.updateBy,
-                    };
-                    files.push(info);
-                    const filePath = `${dir}/${n.name}.ms`;
-                    this.pathToIdCache.set(filePath, n.id);
-                    this.idToPathCache.set(n.id, filePath);
-                }
-            }
-            return files;
-        } catch (error) {
-            logError(`获取文件列表失败: ${String(error)}`);
-            return [];
-        }
-    }
-
-    // 获取文件信息
-    async getFile(fileId: string): Promise<MagicFileInfo | null> {
-        try {
-            const urlPath = `${this.webPrefix}/resource/file/${fileId}`;
-            debug(`GetFile: baseURL=${this.config.url} path=${urlPath}`);
-            const response = await this.httpClient.get(urlPath);
-            const raw = response?.data?.data ?? response?.data ?? null;
-            if (!raw) return null;
-
-            // 基础字段拷贝（容错：后端可能字段不全）
-            const info: MagicFileInfo = {
-                id: String(raw.id ?? fileId),
-                name: String(raw.name ?? ''),
-                path: String(raw.path ?? ''),
-                script: String(raw.script ?? ''),
-                groupId: String(raw.groupId ?? ''),
-                groupPath: String(raw.groupPath ?? ''),
-                type: (raw.type as MagicResourceType) ?? (undefined as any),
-                createTime: raw.createTime,
-                updateTime: raw.updateTime,
-                createBy: raw.createBy,
-                updateBy: raw.updateBy,
-                method: raw.method,
-                requestMapping: raw.requestMapping,
-                description: raw.description,
-                locked: raw.locked,
-                // 类型专属字段（API）
-                params: raw.params ?? raw.parameters,
-                headers: raw.headers,
-                contentType: raw.contentType,
-                timeout: typeof raw.timeout === 'number' ? raw.timeout
-                    : (typeof raw.timeoutMs === 'number' ? raw.timeoutMs : undefined),
-                // 类型专属字段（任务）
-                cron: raw.cron ?? raw.cronExpression,
-                enabled: (typeof raw.enabled !== 'undefined') ? !!raw.enabled
-                    : ((typeof raw.enable !== 'undefined') ? !!raw.enable : undefined),
-                executeOnStart: (typeof raw.executeOnStart !== 'undefined') ? !!raw.executeOnStart
-                    : ((typeof raw.runOnStart !== 'undefined') ? !!raw.runOnStart : undefined),
-                // 完整保留服务端原始扩展字段
-                extra: raw,
-            };
-
-            // 通过缓存的 id->path 映射补全 groupPath/type/name
-            let cachedPath = this.getPathById(info.id);
-            if (!cachedPath && info.groupId) {
-                // 当没有缓存但有 groupId 时，尝试通过资源树补全缓存
-                try {
-                    const group = await this.getGroup(info.groupId);
-                    if (group) {
-                        const guess = `${group.path}/${info.name}.ms`;
-                        cachedPath = guess;
-                        this.idToPathCache.set(info.id, guess);
-                        this.pathToIdCache.set(guess, info.id);
-                    }
-                } catch (e) {
-                    // 忽略补全失败，保留现有字段
-                }
-            }
-
-            if (cachedPath) {
-                const parts = cachedPath.split('/').filter(Boolean);
-                const type = parts[0] as MagicResourceType;
-                const groupPath = parts.slice(0, -1).join('/');
-                const name = parts[parts.length - 1].replace(/\.ms$/, '');
-                info.type = info.type ?? type;
-                info.groupPath = info.groupPath || groupPath;
-                info.name = info.name || name;
-            }
-
-            return info;
-        } catch (error) {
-            logError(`获取文件信息失败: ${String(error)}`);
-            return null;
-        }
-    }
-
-    // 保存文件
     async saveFile(file: MagicFileInfo): Promise<boolean> {
-        try {
-            const type = file.type || this.inferTypeFromId(file.id);
-            if (!type) {
-                logError('保存文件失败：无法解析资源类型');
-                return false;
-            }
-            const entity: any = {
-                id: file.id,
-                groupId: file.groupId,
-                name: file.name,
-                description: file.description,
-            };
-            if (type === 'api') {
-                entity.path = file.path || '';
-                entity.method = (file.method || 'GET').toUpperCase();
-                if (file.requestMapping) entity.requestMapping = file.requestMapping;
-                // 类型专属字段（API）
-                if (typeof file.params !== 'undefined') entity.params = file.params;
-                if (typeof file.headers !== 'undefined') entity.headers = file.headers;
-                if (typeof file.contentType !== 'undefined') entity.contentType = file.contentType;
-                if (typeof file.timeout !== 'undefined') entity.timeout = file.timeout;
-            } else if (type === 'function') {
-                entity.path = file.path || '';
-            } else if (type === 'task') {
-                // 类型专属字段（任务）
-                if (typeof file.cron !== 'undefined') entity.cron = file.cron;
-                if (typeof file.enabled !== 'undefined') entity.enabled = !!file.enabled;
-                if (typeof file.executeOnStart !== 'undefined') entity.executeOnStart = !!file.executeOnStart;
-            }
-            const combined = JSON.stringify(entity) + "\r\n================================\r\n" + (file.script || '');
-            const payload = this.encrypt(combined);
-            const urlPath = `${this.webPrefix}/resource/file/${type}/save`;
-            debug(`SaveFile: path=${urlPath} id=${file.id} name=${file.name}`);
-            const response = await this.httpClient.post(urlPath, payload, { headers: { 'Content-Type': 'application/json' }, params: { auto: 0 } });
-            const ok = response.data?.code === 1;
-            return !!ok;
-        } catch (error) {
-            console.error('保存文件失败:', error);
-            return false;
-        }
+        await this.ensureLogin();
+        const resp = await this.httpClient.post('/file/save', file, { headers: this.getAuthHeaders() });
+        return !!(resp?.data?.success || resp?.data?.code === 200);
     }
 
-    // 创建文件
     async createFile(request: CreateFileRequest): Promise<string | null> {
-        try {
-            const type = request.type;
-            // 解析分组ID（优先 groupId，其次通过资源树从 groupPath 推导）
-            let groupId = request.groupId || null;
-            if (!groupId && request.groupPath) {
-                await this.getResourceDirs();
-                groupId = this.getGroupIdByPath(request.groupPath) || null;
-            }
-            if (!groupId) {
-                vscode.window.showErrorMessage('创建文件失败：未定位到分组，请先创建分组目录');
-                return null;
-            }
-            const entity: any = {
-                groupId,
-                name: request.name,
-                description: request.description,
-            };
-            if (type === 'api') {
-                entity.path = request.requestMapping || request.name;
-                entity.method = (request.method || 'GET').toUpperCase();
-                if (request.requestMapping) entity.requestMapping = request.requestMapping;
-                // 类型专属字段（API）
-                if ((request as any).params !== undefined) entity.params = (request as any).params;
-                if ((request as any).headers !== undefined) entity.headers = (request as any).headers;
-                if ((request as any).contentType !== undefined) entity.contentType = (request as any).contentType;
-                if ((request as any).timeout !== undefined) entity.timeout = (request as any).timeout;
-            } else if (type === 'function') {
-                entity.path = request.requestMapping || request.name;
-            } else if (type === 'task') {
-                // 类型专属字段（任务）
-                if ((request as any).cron !== undefined) entity.cron = (request as any).cron;
-                if ((request as any).enabled !== undefined) entity.enabled = !!(request as any).enabled;
-                if ((request as any).executeOnStart !== undefined) entity.executeOnStart = !!(request as any).executeOnStart;
-            }
-            const combined = JSON.stringify(entity) + "\r\n================================\r\n" + (request.script || '');
-            const payload = this.encrypt(combined);
-            const urlPath = `${this.webPrefix}/resource/file/${type}/save`;
-            debug(`CreateFile: path=${urlPath} groupId=${groupId} name=${request.name}`);
-            const response = await this.httpClient.post(urlPath, payload, { headers: { 'Content-Type': 'application/json' }, params: { auto: 0 } });
-            if (response.data.code === 1) {
-                const id: string | null = response.data.data || null;
-                if (id && request.groupPath) {
-                    const filePath = `${request.groupPath}/${request.name}.ms`;
-                    this.pathToIdCache.set(filePath, id);
-                    this.idToPathCache.set(id, filePath);
-                }
-                return id;
-            }
-            return null;
-        } catch (error) {
-            console.error('创建文件失败:', error);
-            return null;
-        }
+        await this.ensureLogin();
+        const resp = await this.httpClient.post('/file/create', request, { headers: this.getAuthHeaders() });
+        const id = resp?.data?.data || resp?.data?.id || null;
+        return id;
     }
 
-    // 删除文件
     async deleteFile(fileId: string): Promise<boolean> {
-        try {
-            const urlPath = `${this.webPrefix}/resource/delete`;
-            debug(`DeleteFile: path=${urlPath} id=${fileId}`);
-            const response = await this.httpClient.post(urlPath, null, { params: { id: fileId } });
-            return response.data.code === 1;
-        } catch (error) {
-            console.error('删除文件失败:', error);
-            return false;
-        }
+        await this.ensureLogin();
+        const resp = await this.httpClient.post('/file/delete', { id: fileId }, { headers: this.getAuthHeaders() });
+        return !!(resp?.data?.success || resp?.data?.code === 200);
     }
 
-    // 创建分组
     async createGroup(request: CreateGroupRequest): Promise<string | null> {
-        try {
-            const urlPath = `${this.webPrefix}/resource/folder/save`;
-            debug(`CreateGroup: path=${urlPath} name=${request.name} type=${request.type}`);
-            const response = await this.httpClient.post(urlPath, request);
-            if (response.data.code === 1) {
-                return response.data.data || null;
-            }
-            return null;
-        } catch (error) {
-            console.error('创建分组失败:', error);
-            return null;
-        }
+        await this.ensureLogin();
+        const resp = await this.httpClient.post('/group/create', request, { headers: this.getAuthHeaders() });
+        const id = resp?.data?.data || resp?.data?.id || null;
+        return id;
     }
 
-    // 保存分组
     async saveGroup(group: MagicGroupInfo): Promise<boolean> {
-        try {
-            const urlPath = `${this.webPrefix}/resource/folder/save`;
-            debug(`SaveGroup: path=${urlPath} id=${group.id} name=${group.name}`);
-            const response = await this.httpClient.post(urlPath, group);
-            return response.data.code === 1;
-        } catch (error) {
-            console.error('保存分组失败:', error);
-            return false;
-        }
+        await this.ensureLogin();
+        const resp = await this.httpClient.post('/group/save', group, { headers: this.getAuthHeaders() });
+        return !!(resp?.data?.success || resp?.data?.code === 200);
     }
 
-    // 删除分组
     async deleteGroup(groupId: string): Promise<boolean> {
-        try {
-            const urlPath = `${this.webPrefix}/resource/delete`;
-            debug(`DeleteGroup: path=${urlPath} id=${groupId}`);
-            const response = await this.httpClient.post(urlPath, null, { params: { id: groupId } });
-            return response.data.code === 1;
-        } catch (error) {
-            console.error('删除分组失败:', error);
-            return false;
-        }
+        await this.ensureLogin();
+        const resp = await this.httpClient.post('/group/delete', { id: groupId }, { headers: this.getAuthHeaders() });
+        return !!(resp?.data?.success || resp?.data?.code === 200);
     }
 
-    // 根据路径获取文件ID
     getFileIdByPath(path: string): string | undefined {
-        const key = String(path || '').replace(/^\/+/, '');
-        return this.pathToIdCache.get(key);
+        return this.pathToIdCache.get(path);
     }
 
-    // 根据路径获取分组ID
     getGroupIdByPath(path: string): string | undefined {
         return this.pathToIdCache.get(path);
     }
 
-    // 根据ID获取路径
     getPathById(id: string): string | undefined {
         return this.idToPathCache.get(id);
     }
 
-    // 构建分组路径
     private buildGroupPath(group: MagicGroupInfo, allGroups: MagicGroupInfo[]): string {
-        const path: string[] = [];
-        let current = group;
-        
-        while (current) {
-            path.unshift(current.name);
-            if (!current.parentId) {
-                break;
-            }
-            current = allGroups.find(g => g.id === current.parentId)!;
+        const path: string[] = [group.name];
+        let parentId = group.parentId;
+        while (parentId) {
+            const p = allGroups.find(g => g.id === parentId);
+            if (!p) break;
+            path.unshift(p.name);
+            parentId = p.parentId;
         }
-        
         return path.join('/');
     }
 
-    // 获取所有目录（优先使用原始接口 /resource/dirs，失败时回退到 /resource 树）
     async getResourceDirs(): Promise<string[]> {
-        // 尝试原始实现：GET /resource/dirs
-        // try {
-        //     const urlPath = `${this.webPrefix}/resource/dirs`;
-        //     debug(`GetResourceDirs[dirs]: baseURL=${this.config.url} path=${urlPath}`);
-        //     const response = await this.httpClient.get(urlPath);
-        //     const raw = response.data;
-        //     const arr = Array.isArray(raw) ? raw
-        //         : Array.isArray(raw?.data) ? raw.data
-        //         : (raw?.code === 1 && Array.isArray(raw?.data)) ? raw.data
-        //         : [];
-        //     let dirs: string[] = (arr || []).map((s: any) => String(s)).filter(Boolean);
-        //     // 兼容可能包含存储前缀的返回值，如 /magic-api/api/user
-        //     dirs = dirs.map((d) => d.replace(/^\/?magic-api\//, '').replace(/^\/+/, ''));
-        //     if (dirs.length > 0) {
-        //         // 为了兼容依赖分组ID的操作（创建/删除），补充一次树以填充缓存映射
-        //         try {
-        //             const treePath = `${this.webPrefix}/resource`;
-        //             debug(`GetResourceDirs[fill-cache]: baseURL=${this.config.url} path=${treePath}`);
-        //             const resp2 = await this.httpClient.post(treePath);
-        //             const tree: any = resp2.data?.data || {};
-        //             for (const type of Object.keys(tree)) {
-        //                 this.collectGroupDirsFromNode(type, tree[type], [], []);
-        //             }
-        //         } catch (e) {
-        //             debug(`填充目录缓存失败（可忽略）: ${String(e)}`);
-        //         }
-        //     }
-        //         return dirs;
-        // } catch (e) {
-        //     debug(`GetResourceDirs[dirs] 调用失败，回退到 /resource 树: ${String(e)}`);
-        // }
-
-        // POST /resource 树
-        try {
-            const urlPath = `${this.webPrefix}/resource`;
-            debug(`GetResourceDirs[tree]: baseURL=${this.config.url} path=${urlPath}`);
-            const response = await this.httpClient.post(urlPath);
-            const tree: any = response.data?.data || {};
-            const dirs: string[] = [];
-            for (const type of Object.keys(tree)) {
-                // 顶层类型目录也加入，保证根展示类型名称
-                dirs.push(type);
-                this.collectGroupDirsFromNode(type, tree[type], [], dirs);
-            }
-            return dirs;
-        } catch (error) {
-            logError(`获取资源目录失败: ${String(error)}`);
-            return [];
-        }
-    }
-
-    // 按目录获取文件（优先使用原始接口 /resource/files?dir=...，失败时回退到 /resource 树）
-    async getResourceFiles(dir: string): Promise<MagicFileInfo[]> {
-        try {
-            const urlPath = `${this.webPrefix}/resource`;
-            debug(`GetResourceFiles[tree]: baseURL=${this.config.url} path=${urlPath} dir=${dir}`);
-            const response = await this.httpClient.post(urlPath);
-            const tree: any = response.data?.data || {};
-            const [type, ...segs] = dir.split('/').filter(Boolean);
+        const resp = await this.httpClient.post('/resource');
+        const tree = resp?.data?.data || {};
+        const dirs: string[] = [];
+        for (const type of Object.keys(tree)) {
             const root = tree[type];
-            if (!root) return [];
-            const groupNode = this.findGroupNodeByPath(root, segs);
-            const files: MagicFileInfo[] = [];
-            if (!groupNode) return files;
-            const children: any[] = groupNode.children || [];
-            for (const child of children) {
-                const n = child.node || {};
-                const isFile = n && typeof n.groupId !== 'undefined' && typeof n.type === 'undefined';
-                if (isFile) {
-                    const info: MagicFileInfo = {
-                        id: String(n.id),
-                        name: String(n.name),
-                        path: String(n.path || ''),
-                        script: '',
-                        groupId: String(n.groupId || ''),
-                        groupPath: dir,
-                        type: type as MagicResourceType,
-                        createTime: n.createTime,
-                        updateTime: n.updateTime,
-                        createBy: n.createBy,
-                        updateBy: n.updateBy,
-                    };
-                    files.push(info);
-                    const filePath = `${dir}/${n.name}.ms`;
-                    this.pathToIdCache.set(filePath, info.id);
-                    this.idToPathCache.set(info.id, filePath);
-                }
+            this.collectGroupDirsFromNode(type, root, [], dirs);
+        }
+        return dirs;
+    }
+
+    async getResourceFiles(dir: string): Promise<MagicFileInfo[]> {
+        const resp = await this.httpClient.post('/resource');
+        const tree = resp?.data?.data || {};
+        const segs = dir.split('/').filter(Boolean);
+        const type = segs[0];
+        const root = tree[type];
+        if (!root) return [];
+        const groupNode = this.findGroupNodeByPath(root, segs.slice(1));
+        const target = groupNode || root;
+        const files: MagicFileInfo[] = [];
+        const children: any[] = target.children || [];
+        for (const child of children) {
+            const n = child.node || {};
+            const isFile = n && typeof n.script === 'string';
+            if (isFile) {
+                const info: MagicFileInfo = {
+                    id: String(n.id || ''),
+                    name: String(n.name || ''),
+                    type: type as MagicResourceType,
+                    groupId: String(n.groupId || ''),
+                    groupPath: `${type}/${this.buildPathFromNode(root, String(n.groupId || ''))}`,
+                    path: String(n.path || ''),
+                    requestMapping: String(n.requestMapping || ''),
+                    method: String(n.method || ''),
+                    description: String(n.description || ''),
+                    script: String(n.script || ''),
+                };
+                files.push(info);
+                if (info.id) this.idToPathCache.set(info.id, `${info.groupPath}/${info.name}.ms`);
             }
-            return files;
-        } catch (error) {
-            logError(`获取资源文件失败: ${String(error)}`);
-            return [];
+        }
+        return files;
+    }
+
+    // 新增：根据目录获取分组原始元数据（用于写入 .group.meta.json）
+    async getGroupMetaByDir(dir: string): Promise<MagicGroupMetaRaw | null> {
+        try {
+            const resp = await this.httpClient.post('/resource');
+            const tree = resp?.data?.data || {};
+            const segs = dir.split('/').filter(Boolean);
+            const type = segs[0];
+            const root = tree[type];
+            if (!root) return null;
+            if (segs.length <= 1) return null; // 顶层类型目录没有分组节点
+            const groupNode = this.findGroupNodeByPath(root, segs.slice(1));
+            if (!groupNode) return null;
+            const n = groupNode.node || {};
+            const raw: MagicGroupMetaRaw = {
+                properties: n.properties || {},
+                id: String(n.id || ''),
+                name: String(n.name || ''),
+                type: (n.type || type) as MagicResourceType,
+                parentId: n.parentId ? String(n.parentId) : undefined,
+                path: String(n.path || ''),
+                createTime: n.createTime,
+                updateTime: n.updateTime,
+                createBy: n.createBy,
+                updateBy: n.updateBy,
+                paths: n.paths || [],
+                options: n.options || []
+            };
+            return raw;
+        } catch {
+            return null;
         }
     }
 
-    // 获取 LSP 服务器地址
     getLspServerUrl(): string {
         const base = new URL(this.config.url);
         const wsProto = base.protocol === 'https:' ? 'wss' : 'ws';
-        // 端口优先使用 lspPort，其次使用 URL 中的端口，最后回退到 8081
-        const port = this.config.lspPort ?? (base.port ? Number(base.port) : 8081);
-        const hostPort = `${base.hostname}:${port}`;
-        // 路径前缀合并：同时考虑 URL 的 context-path 与 webPrefix，避免重复
-        const basePath = (base.pathname || '').replace(/\/$/, '');
-        const cfgPrefix = (this.webPrefix || '').replace(/\/$/, '');
-        let prefix = '';
-        if (basePath && cfgPrefix) {
-            if (cfgPrefix.startsWith(basePath)) {
-                prefix = cfgPrefix; // 例如 basePath=/app, cfgPrefix=/app/magic/web → 使用 cfgPrefix
-            } else if (basePath.startsWith(cfgPrefix)) {
-                prefix = basePath;
-            } else {
-                prefix = `${basePath}${cfgPrefix}`; // 合并 /app + /magic/web → /app/magic/web
-            }
-        } else {
-            prefix = basePath || cfgPrefix || '';
+        const cfgPort = this.config.lspPort;
+        const basePath = base.pathname.replace(/\/$/, '');
+        const cfgPrefix = basePath;
+        let hostPort = base.host;
+        if (cfgPort) {
+            const port = String(cfgPort);
+            hostPort = `${base.hostname}:${port}`;
         }
-        const wsUrl = `${wsProto}://${hostPort}${prefix}/lsp`;
-        debug(`LSP URL computed: ${wsUrl} (host=${base.hostname}, port=${port}, basePath=${basePath || '/'}, cfgPrefix=${cfgPrefix || ''})`);
+        const wsUrl = `${wsProto}://${hostPort}${cfgPrefix}/lsp`;
+        debug(`LSP WS URL computed: ${wsUrl} (host=${base.hostname}, port=${cfgPort || base.port}, basePath=${basePath || '/'}, cfgPrefix=${cfgPrefix || ''})`);
         return wsUrl;
     }
 
-    // 获取调试服务器地址
     getDebugServerUrl(): string {
         const base = new URL(this.config.url);
         const wsProto = base.protocol === 'https:' ? 'wss' : 'ws';
-        // 端口优先使用 debugPort，其次使用 URL 中的端口，最后回退到协议默认端口（http:80 / https:443）
-        const defaultPort = base.protocol === 'https:' ? 443 : 80;
-        const port = this.config.debugPort ?? (base.port ? Number(base.port) : defaultPort);
-        const hostPort = `${base.hostname}:${port}`;
-        // 路径前缀合并逻辑同上
-        const basePath = (base.pathname || '').replace(/\/$/, '');
-        const cfgPrefix = (this.webPrefix || '').replace(/\/$/, '');
-        let prefix = '';
-        if (basePath && cfgPrefix) {
-            if (cfgPrefix.startsWith(basePath)) {
-                prefix = cfgPrefix;
-            } else if (basePath.startsWith(cfgPrefix)) {
-                prefix = basePath;
-            } else {
-                prefix = `${basePath}${cfgPrefix}`;
-            }
-        } else {
-            prefix = basePath || cfgPrefix || '';
-        }
-        const wsUrl = `${wsProto}://${hostPort}${prefix}/debug`;
+        const port = this.config.debugPort || (base.port ? Number(base.port) : (base.protocol === 'https:' ? 443 : 80));
+        const basePath = base.pathname.replace(/\/$/, '');
+        const cfgPrefix = basePath;
+        const hostPort = this.config.debugPort ? `${base.hostname}:${port}` : base.host;
+        const wsUrl = `${wsProto}://${hostPort}${cfgPrefix}/debug`;
         debug(`Debug WS URL computed: ${wsUrl} (host=${base.hostname}, port=${port}, basePath=${basePath || '/'}, cfgPrefix=${cfgPrefix || ''})`);
         return wsUrl;
     }
@@ -763,70 +464,78 @@ export class MagicApiClient {
     // 从资源树根构建指定分组的路径
     private buildPathFromNode(root: any, targetId: string): string {
         const path: string[] = [];
-        // DFS 追溯路径
-        const dfs = (node: any, segs: string[]): boolean => {
+        const stack: any[] = [root];
+        const parentMap = new Map<any, any>();
+        while (stack.length) {
+            const cur = stack.pop();
+            const children: any[] = cur.children || [];
+            for (const child of children) {
+                parentMap.set(child, cur);
+                stack.push(child);
+            }
+        }
+        // DFS 找到目标节点
+        const findNode = (node: any): any | null => {
             const n = node.node || {};
-            const isGroup = n && (typeof n.parentId !== 'undefined' || typeof n.type !== 'undefined');
-            let localSegs = segs;
-            if (isGroup && n.name && n.id !== '0') {
-                localSegs = segs.concat([n.name]);
-            }
-            if (isGroup && n.id === targetId) {
-                path.push(...localSegs);
-                return true;
-            }
+            if (String(n.id || '') === String(targetId || '')) return node;
             for (const child of (node.children || [])) {
-                if (dfs(child, localSegs)) return true;
+                const r = findNode(child);
+                if (r) return r;
             }
-            return false;
+            return null;
         };
-        dfs(root, []);
-        const type = (root?.node?.type) || '';
-        return path.join('/');
+        const target = findNode(root);
+        if (!target) return '';
+        // 回溯构建路径名
+        let cur: any | undefined = target;
+        const nameSegs: string[] = [];
+        while (cur && cur !== root) {
+            const n = cur.node || {};
+            const isGroup = n && (typeof n.parentId !== 'undefined' || typeof n.type !== 'undefined');
+            if (isGroup) nameSegs.unshift(String(n.name || ''));
+            cur = parentMap.get(cur);
+        }
+        return nameSegs.join('/');
     }
 
-    // 推断资源类型（api/function 等）
     private inferTypeFromId(id?: string): MagicResourceType | undefined {
         if (!id) return undefined;
-        const p = this.idToPathCache.get(id);
-        if (!p) return undefined;
-        const type = p.split('/')[0] as MagicResourceType;
-        return type;
+        if (id.startsWith('api_')) return 'api';
+        if (id.startsWith('task_')) return 'task';
+        if (id.startsWith('function_')) return 'function';
+        return undefined;
     }
 
-    // ROT13 编码（与后端 MagicResourceController.saveFile 解密一致）
     private rot13(input: string): string {
-        return input.replace(/[a-zA-Z]/g, (c) => {
-            const base = c <= 'Z' ? 'A'.charCodeAt(0) : 'a'.charCodeAt(0);
-            const code = c.charCodeAt(0) - base;
-            return String.fromCharCode(((code + 13) % 26) + base);
+        return input.replace(/[a-zA-Z]/g, (char) => {
+            const code = char.charCodeAt(0);
+            const base = code >= 97 ? 97 : 65;
+            return String.fromCharCode(((code - base + 13) % 26) + base);
         });
     }
 
-    // 与后端 ROT13Utils.encrypt 等效：Base64 后再 ROT13
     private encrypt(input: string): string {
-        const base64 = Buffer.from(input, 'utf8').toString('base64');
-        return this.rot13(base64);
+        const rot = this.rot13(input);
+        return Buffer.from(rot, 'utf8').toString('base64');
     }
-    
-    // 获取本地提示补全所需的工作台数据（classes/extensions/functions）
+
     async getWorkbenchCompletionData(): Promise<any | null> {
         try {
-            // 将可配置的 webPrefix 转换为 workbench 前缀
-            const workbenchPrefix = this.webPrefix.replace(/\/web(\b|$)/, '/workbench');
-            const url = `${workbenchPrefix}/classes`;
-            debug(`Workbench classes: baseURL=${this.config.url} path=${url}`);
-            // 优先 POST（兼容服务端常见实现），失败则回退到 GET
-            try {
-                const resp = await this.httpClient.post(url);
-                return resp?.data?.data ?? resp?.data ?? null;
-            } catch (e1) {
-                const resp2 = await this.httpClient.get(url);
-                return resp2?.data?.data ?? resp2?.data ?? null;
-            }
-        } catch (err) {
-            debug(`获取工作台数据失败: ${String(err)}`);
+            const resp = await this.httpClient.post('/workbench');
+            const data = resp?.data?.data || null;
+            return data;
+        } catch {
             return null;
+        }
+    }
+
+    async searchWorkbench(keyword: string): Promise<Array<{ id: string; text: string; line: number }>> {
+        try {
+            const resp = await this.httpClient.post('/workbench/search', { keyword });
+            const data = resp?.data?.data || [];
+            return data;
+        } catch {
+            return [];
         }
     }
 }

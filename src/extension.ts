@@ -94,10 +94,6 @@ class MagicApiDebugConfigurationProvider implements vscode.DebugConfigurationPro
                 config.resourceType = config.resourceType ?? infoToUse.type;
                 config.method = config.method ?? infoToUse.method;
                 config.requestMapping = config.requestMapping ?? infoToUse.requestMapping;
-                // 提供额外路径字段，兼容服务端不同的参数命名
-                (config as any).target = (config as any).target ?? fileKey;
-                (config as any).path = (config as any).path ?? fileKey;
-                (config as any).programPath = (config as any).programPath ?? fileKey;
             }
         }
 
@@ -194,9 +190,65 @@ export function activate(context: vscode.ExtensionContext) {
 	// 对当前已打开的文档进行一次修正
 	vscode.workspace.textDocuments.forEach((doc) => { ensureMagicScriptLanguage(doc); });
 
-	// 文档打开时修正语言模式
+	// 当用户打开 .magic-api-mirror.json 文件时，在未连接且仅首次点击时提示连接
+	const maybePromptConnectForMagicFile = async (doc: vscode.TextDocument) => {
+		try {
+			if (doc.uri.scheme !== 'file') return;
+			const name = doc.fileName.replace(/^.*[\\/]/, '');
+			if (name !== '.magic-api-mirror.json') return;
+			const root = vscode.Uri.joinPath(doc.uri, '..');
+
+			// 若该镜像根已连接，则不提示
+			if ((mirrorManager as any).isMirrorRootConnected?.(root)) return;
+
+			// 本窗口只提示一次
+			const shownKey = `magicApi.promptedMirrorRoot:${root.fsPath}`;
+			const hasShown = !!context.workspaceState.get<boolean>(shownKey);
+			if (hasShown) return;
+
+			const meta = await mirrorManager.readMirrorMeta(root);
+			const action = await vscode.window.showInformationMessage(
+				'检测到镜像标记文件，是否连接该镜像工作区以启用同步？',
+				'连接', '取消'
+			);
+			await context.workspaceState.update(shownKey, true);
+			if (action !== '连接') return;
+
+			let clientForMirror: MagicApiClient | undefined;
+			if (meta?.url) {
+				const fromManager = serverManager.getServers().find(s => s.url === meta.url);
+				const cfg: MagicServerConfig = fromManager ?? {
+					id: `mirror_${meta.url.replace(/^https?:\/\//, '').replace(/\/$/, '').replace(/[^a-zA-Z0-9._-]/g, '_')}`,
+					name: `Mirror: ${new URL(meta.url).host}`,
+					url: meta.url!,
+					token: (meta as any).token,
+					username: (meta as any).username,
+					password: (meta as any).password,
+					lspPort: (meta as any).lspPort,
+					debugPort: (meta as any).debugPort,
+				} as MagicServerConfig;
+				clientForMirror = new MagicApiClient(cfg);
+			} else {
+				clientForMirror = serverManager.getCurrentClient() || undefined;
+			}
+			if (!clientForMirror) {
+				vscode.window.showWarningMessage('无法获取连接信息，已取消连接该镜像工作区。');
+				return;
+			}
+			const disposables = mirrorManager.startMirrorListeners(clientForMirror, root);
+			context.subscriptions.push(...disposables);
+			try {
+				await (mirrorManager as any).compareAndSyncOnLoad?.(clientForMirror, root);
+			} catch {}
+		} catch {}
+	};
+
+	// 文档打开时修正语言模式，并在打开 .magic-api-mirror.json 文件时提示连接镜像
 	context.subscriptions.push(
-		vscode.workspace.onDidOpenTextDocument((doc) => { ensureMagicScriptLanguage(doc); })
+		vscode.workspace.onDidOpenTextDocument(async (doc) => {
+			await ensureMagicScriptLanguage(doc);
+			await maybePromptConnectForMagicFile(doc);
+		})
 	);
 
 	// 编辑器切换时修正语言模式
@@ -205,11 +257,6 @@ export function activate(context: vscode.ExtensionContext) {
 			if (editor) { ensureMagicScriptLanguage(editor.document); }
 		})
 	);
-
-	// 自动启动 LSP（如果有当前服务器）
-	if (serverManager.getCurrentServer()) {
-		remoteLspClient.start();
-	}
 
     // 如果当前打开的是非镜像工作区且已选择服务器，主动提示创建镜像工作区
     (async () => {
@@ -222,6 +269,7 @@ export function activate(context: vscode.ExtensionContext) {
                 const isMirror = await mirrorManager.isMirrorWorkspace(currentFolder);
                 if (!isMirror) {
                     await mirrorManager.promptCreateMirrorWorkspaceIfNeeded(currentClient, currentServer);
+                    remoteLspClient.start();
                 }
             }
         } catch {}
@@ -402,6 +450,82 @@ function registerCommands(
             await MirrorWorkspaceManager.getInstance(context).openMirrorWorkspace(client, folder, serverCfg!);
         }
     });
+
+	// 连接镜像根（右键 .magic-api-mirror.json）
+	const connectMirrorRootCommand = vscode.commands.registerCommand('magicApi.connectMirrorRoot', async (uri?: vscode.Uri) => {
+		try {
+			let root: vscode.Uri | null = null;
+			if (uri && uri.scheme === 'file') {
+				const baseName = uri.fsPath.replace(/^.*[\\\/]/, '');
+				if (baseName === '.magic-api-mirror.json') {
+					root = vscode.Uri.joinPath(uri, '..');
+				} else {
+					root = await mirrorManager.findMirrorRootForUri(uri);
+				}
+			}
+			if (!root) {
+				vscode.window.showErrorMessage('未能定位镜像工作区根目录');
+				return;
+			}
+			if (mirrorManager.isMirrorRootConnected(root)) {
+				vscode.window.showInformationMessage('该镜像工作区已连接');
+				return;
+			}
+			const meta = await mirrorManager.readMirrorMeta(root);
+			let clientForMirror: MagicApiClient | undefined;
+			if (meta?.url) {
+				const fromManager = serverManager.getServers().find(s => s.url === meta.url);
+				const cfg: MagicServerConfig = fromManager ?? {
+					id: `mirror_${meta.url.replace(/^[a-zA-Z]+:\/\//, '').replace(/\/$/, '').replace(/[^a-zA-Z0-9._-]/g, '_')}`,
+					name: `Mirror: ${new URL(meta.url).host}`,
+					url: meta.url!,
+					token: (meta as any).token,
+					username: (meta as any).username,
+					password: (meta as any).password,
+					lspPort: (meta as any).lspPort,
+					debugPort: (meta as any).debugPort,
+				} as MagicServerConfig;
+				clientForMirror = new MagicApiClient(cfg);
+			} else {
+				clientForMirror = serverManager.getCurrentClient() || undefined;
+			}
+			if (!clientForMirror) {
+				vscode.window.showWarningMessage('无法获取连接信息，已取消连接该镜像工作区。');
+				return;
+			}
+			await mirrorManager.connectMirrorRoot(clientForMirror, root);
+			vscode.window.showInformationMessage('镜像工作区已连接');
+		} catch {
+			vscode.window.showErrorMessage('连接镜像工作区失败');
+		}
+	});
+
+	// 断开镜像根（右键 .magic-api-mirror.json）
+	const disconnectMirrorRootCommand = vscode.commands.registerCommand('magicApi.disconnectMirrorRoot', async (uri?: vscode.Uri) => {
+		try {
+			let root: vscode.Uri | null = null;
+			if (uri && uri.scheme === 'file') {
+				const baseName = uri.fsPath.replace(/^.*[\\\/]/, '');
+				if (baseName === '.magic-api-mirror.json') {
+					root = vscode.Uri.joinPath(uri, '..');
+				} else {
+					root = await mirrorManager.findMirrorRootForUri(uri);
+				}
+			}
+			if (!root) {
+				vscode.window.showErrorMessage('未能定位镜像工作区根目录');
+				return;
+			}
+			if (!mirrorManager.isMirrorRootConnected(root)) {
+				vscode.window.showInformationMessage('该镜像工作区尚未连接');
+				return;
+			}
+			mirrorManager.disconnectMirrorRoot(root);
+			vscode.window.showInformationMessage('已断开镜像工作区连接');
+		} catch {
+			vscode.window.showErrorMessage('断开镜像工作区失败');
+		}
+	});
 
 	// 创建新文件
 	const createFileCommand = vscode.commands.registerCommand('magicApi.createFile', async (uri?: vscode.Uri) => {
@@ -708,6 +832,8 @@ function registerCommands(
 		refreshFileInfoCommand,
 		restartLspCommand,
 		connectWorkspaceCommand,
+		connectMirrorRootCommand,
+		disconnectMirrorRootCommand,
 		createFileCommand,
 		createGroupCommand,
 		runScriptCommand,
