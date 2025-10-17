@@ -19,6 +19,17 @@ export interface MagicFileInfo {
     requestMapping?: string;
     description?: string;
     locked?: boolean;
+    // 类型专属字段：API
+    params?: any[];
+    headers?: Record<string, any> | any;
+    contentType?: string;
+    timeout?: number;
+    // 类型专属字段：任务
+    cron?: string;
+    enabled?: boolean;
+    executeOnStart?: boolean;
+    // 其他服务端扩展字段（未识别的字段原样保留）
+    extra?: Record<string, any>;
 }
 
 export interface MagicGroupInfo {

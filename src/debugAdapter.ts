@@ -9,6 +9,8 @@ import WebSocket from 'ws';
 import { MessageConnection, createMessageConnection } from 'vscode-jsonrpc';
 import { WebSocketMessageReader, WebSocketMessageWriter } from 'vscode-ws-jsonrpc/cjs';
 import { ServerManager } from './serverManager';
+import { StatusBarManager } from './statusBarManager';
+import { MirrorWorkspaceManager } from './mirrorWorkspaceManager';
 
 interface LaunchRequestArguments extends DebugProtocol.LaunchRequestArguments {
     program: string;
@@ -17,6 +19,12 @@ interface LaunchRequestArguments extends DebugProtocol.LaunchRequestArguments {
     port?: number;
     serverId?: string;
     host?: string;
+    useWss?: boolean; // 当直连 host/port 时，是否使用 wss 协议（例如源 URL 为 https）
+    pathBase?: string; // 直连场景下的 URL 基础路径（例如 /app），与 webPrefix 合并
+    // 认证信息（用于基于 host/port 的直连，不依赖全局当前服务器）
+    token?: string;
+    username?: string;
+    password?: string;
 }
 
 export class MagicApiDebugSession extends DebugSession {
@@ -92,8 +100,24 @@ export class MagicApiDebugSession extends DebugSession {
                     return;
                 }
             } else if (args.host && args.port) {
-                // 按 host/port 组装 WS 地址（默认 ws 协议）
-                debugUrl = `ws://${args.host}:${args.port}/magic/debug`;
+                // 按 host/port 组装 WS 地址（默认 ws 协议），考虑 webPrefix
+                const cfg = vscode.workspace.getConfiguration('magicApi');
+                const cfgPrefix = (cfg.get<string>('webPrefix', '/magic/web') || '').replace(/\/$/, '');
+                const basePath = String(args.pathBase || '').replace(/\/$/, '');
+                let prefix = '';
+                if (basePath && cfgPrefix) {
+                    if (cfgPrefix.startsWith(basePath)) {
+                        prefix = cfgPrefix;
+                    } else if (basePath.startsWith(cfgPrefix)) {
+                        prefix = basePath;
+                    } else {
+                        prefix = `${basePath}${cfgPrefix}`;
+                    }
+                } else {
+                    prefix = basePath || cfgPrefix || '';
+                }
+                const proto = args.useWss ? 'wss' : 'ws';
+                debugUrl = `${proto}://${args.host}:${args.port}${prefix}/debug`;
             } else {
                 const serverManager = ServerManager.getInstance();
                 const current = serverManager.getCurrentServer();
@@ -112,7 +136,18 @@ export class MagicApiDebugSession extends DebugSession {
             // 建立 WebSocket 连接并创建 JSON-RPC 通道（附带认证头）
             const serverManager = ServerManager.getInstance();
             const client = serverManager.getCurrentClient();
-            const headers = client?.getAuthHeaders() || {};
+            const isDirectHostPort = !!(args.host && args.port);
+            // 优先使用 launch 参数中的认证信息，其次回退到当前服务器的认证
+            const headers: Record<string, string> = {};
+            if (args.token) {
+                headers['magic-token'] = args.token;
+            } else if (args.username && args.password) {
+                const b64 = Buffer.from(`${args.username}:${args.password}`).toString('base64');
+                headers['Authorization'] = `Basic ${b64}`;
+            } else if (!isDirectHostPort) {
+                // 仅在使用 serverId / 当前服务器场景下才回退到全局认证，避免镜像文件夹调试受全局影响
+                Object.assign(headers, client?.getAuthHeaders() || {});
+            }
             this._ws = new WebSocket(debugUrl, { perMessageDeflate: false, headers });
 
             this._ws.on('open', async () => {
@@ -139,9 +174,17 @@ export class MagicApiDebugSession extends DebugSession {
                     this.sendEvent(new StoppedEvent(evt?.reason || 'breakpoint', MagicApiDebugSession.THREAD_ID));
                 });
                 this._connection.onNotification('output', (evt: any) => {
-                    const category = typeof evt?.category === 'string' ? evt.category : undefined;
-                    const output = typeof evt?.output === 'string' ? evt.output : JSON.stringify(evt);
-                    this.sendEvent(new OutputEvent(output, category));
+                    const category = typeof evt?.category === 'string' ? evt.category : 'stdout';
+                    // 仅转发程序输出：stdout/stderr；忽略 console 等内部事件
+                    if (category !== 'stdout' && category !== 'stderr') {
+                        return;
+                    }
+                    const output = typeof evt?.output === 'string'
+                        ? evt.output
+                        : (evt?.output != null ? JSON.stringify(evt.output) : undefined);
+                    if (typeof output === 'string' && output.length > 0) {
+                        this.sendEvent(new OutputEvent(output, category));
+                    }
                 });
                 this._connection.onNotification('terminated', () => {
                     this.sendEvent(new TerminatedEvent());
@@ -199,9 +242,16 @@ export class MagicApiDebugSession extends DebugSession {
     // 旧的 TCP 连接与桥接消息处理逻辑已移除，改为 JSON-RPC over WebSocket
 
     protected async setBreakPointsRequest(response: DebugProtocol.SetBreakpointsResponse, args: DebugProtocol.SetBreakpointsArguments): Promise<void> {
+        // 统一扩展端 Source.path：magic-api:/<type>/<groupPath>/<name>.ms
+        const normalizedArgs: DebugProtocol.SetBreakpointsArguments = { ...args };
+        if (normalizedArgs.source && typeof normalizedArgs.source.path === 'string') {
+            normalizedArgs.source = { ...normalizedArgs.source };
+            normalizedArgs.source.path = await this.normalizeSourcePathAsync(String(normalizedArgs.source.path || ''));
+        }
+
         if (this._connection && this._isConnected) {
             try {
-                const remote = await this._connection.sendRequest('setBreakpoints', args);
+                const remote = await this._connection.sendRequest('setBreakpoints', normalizedArgs);
                 response.body = remote as any;
             } catch (e) {
                 this.sendEvent(new OutputEvent(`设置断点失败: ${e}\n`));
@@ -209,7 +259,7 @@ export class MagicApiDebugSession extends DebugSession {
             }
         } else {
             // 本地回退：直接标记为可验证断点
-            const clientLines = args.lines || [];
+            const clientLines = normalizedArgs.lines || [];
             const actualBreakpoints = clientLines.map(line => {
                 const bp = new Breakpoint(true, line) as DebugProtocol.Breakpoint;
                 bp.id = this.generateBreakpointId();
@@ -337,6 +387,62 @@ export class MagicApiDebugSession extends DebugSession {
         } finally {
             this._isConnected = false;
             this.sendResponse(response);
+        }
+    }
+
+    private async normalizeSourcePathAsync(pathStr: string): Promise<string> {
+        try {
+            const prefixes = ['api', 'function', 'datasource', 'task'];
+            let raw = String(pathStr || '');
+            // 已是 magic-api scheme：仅规范 path
+            if (raw.startsWith('magic-api:')) {
+                const uri = vscode.Uri.parse(raw);
+                const p = String(uri.path || '').replace(/^\/+/, '');
+                const firstSeg = p.split('/')[0] || '';
+                const hasTypePrefix = prefixes.includes(firstSeg);
+                const normalized = hasTypePrefix ? p : `${firstSeg || 'api'}/${p}`;
+                return `magic-api:/${normalized}`;
+            }
+
+            // 本地文件路径：尝试识别镜像工作区并解析为 magic-api 路径
+            let fileUri: vscode.Uri;
+            try {
+                // 直接按本地文件构造 URI（兼容 Windows 路径）
+                fileUri = vscode.Uri.file(raw);
+            } catch {
+                // 无法解析为 file，回退到原有逻辑
+                const fallback = raw.replace(/^\/+/, '');
+                const firstSeg = fallback.split('/')[0] || '';
+                const hasTypePrefix = prefixes.includes(firstSeg);
+                const finfo = StatusBarManager.getInstance().getCurrentFileInfo();
+                const type = finfo?.type || firstSeg || 'api';
+                const normalized = hasTypePrefix ? fallback : `${type}/${fallback}`;
+                return `magic-api:/${normalized}`;
+            }
+
+            try {
+                const mirrorManager = MirrorWorkspaceManager.getInstance();
+                const mirrorRoot = await mirrorManager.findMirrorRootForUri(fileUri);
+                if (mirrorRoot) {
+                    const parsed = mirrorManager.parseMirrorFile(mirrorRoot, fileUri);
+                    if (parsed.typedPath) {
+                        return `magic-api:/${parsed.typedPath}`;
+                    }
+                }
+            } catch {
+                // 忽略镜像解析失败，继续回退
+            }
+
+            // 回退：根据状态栏或首段推断类型
+            const fallback = raw.replace(/^\/+/, '');
+            const firstSeg = fallback.split('/')[0] || '';
+            const hasTypePrefix = prefixes.includes(firstSeg);
+            const finfo = StatusBarManager.getInstance().getCurrentFileInfo();
+            const type = finfo?.type || firstSeg || 'api';
+            const normalized = hasTypePrefix ? fallback : `${type}/${fallback}`;
+            return `magic-api:/${normalized}`;
+        } catch {
+            return pathStr;
         }
     }
 }

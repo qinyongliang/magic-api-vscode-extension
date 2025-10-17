@@ -5,11 +5,14 @@
   "fileTypes": ["ms", "magic"],
   "patterns": [
     { "include": "#comments" },
+    { "include": "#dbSqlTemplate" },
     { "include": "#strings" },
+    { "include": "#templateStrings" },
     { "include": "#numbers" },
     { "include": "#keywords" },
+    { "include": "#operators" },
     { "include": "#importAlias" },
-    { "include": "source.js" }
+    { "include": "#languageBlock" }
   ],
   "repository": {
     "comments": {
@@ -22,6 +25,21 @@
           "name": "comment.block.magic-script",
           "begin": "/\\*",
           "end": "\\*/"
+        }
+      ]
+    },
+    "dbSqlTemplate": {
+      "patterns": [
+        {
+          "name": "meta.sql.in.db.magic-script",
+          "begin": "\\b(db(?:\\.[A-Za-z_][A-Za-z0-9_]*)*)\\s*\\(\\s*\"\"\"",
+          "beginCaptures": {
+            "1": { "name": "support.function.db.magic-script" }
+          },
+          "end": "\"\"\"",
+          "patterns": [
+            { "include": "source.sql" }
+          ]
         }
       ]
     },
@@ -54,9 +72,29 @@
         {
           "name": "string.regexp.magic-script",
           "begin": "/",
-          "end": "/[gimuy]*",
+          "end": "/[gimsuy]*",
           "patterns": [
             { "name": "constant.character.escape.magic-script", "match": "\\/" }
+          ]
+        }
+      ]
+    },
+    "templateStrings": {
+      "patterns": [
+        {
+          "name": "string.template.magic-script",
+          "begin": "`",
+          "end": "`",
+          "patterns": [
+            { "name": "constant.character.escape.magic-script", "match": "\\\\[btnrfe0'\"\\\\]" },
+            {
+              "name": "meta.embedded.magic-script",
+              "begin": "\\$\\{",
+              "end": "\\}",
+              "patterns": [
+                { "include": "source.magic-script" }
+              ]
+            }
           ]
         }
       ]
@@ -71,15 +109,7 @@
       "patterns": [
         {
           "name": "constant.numeric.magic-script",
-          "match": "(?x)
-            (?:
-              0x[0-9A-Fa-f]+ |              # hex
-              0b[01]+ |                     # binary
-              0o[0-7]+ |                    # octal
-              (?:\\d+\\.\\d*|\\.\\d+|\\d+)(?:[eE][+-]?\\d+)? # decimal/float
-            )
-            (?:[bBsSlLfFdDmM])?             # type suffix
-          "
+          "match": "(?x)\n             (?:\n               0x[0-9A-Fa-f_]+ |            # hex with underscores\n               0b[01_]+ |                   # binary with underscores\n               \\d[0-9_]*(?:\\.[0-9_]+)?  # decimal/float with underscores\n             )\n             (?:[bBsSlLfFdDmM])?             # type suffix\n          "
         }
       ]
     },
@@ -87,8 +117,17 @@
       "patterns": [
         {
           "name": "keyword.control.magic-script",
-          "match": "\\b(var|if|for|in|continue|break|return|exit|try|catch|finally|import|as|new|true|false|null|async|function)\\b"
+          "match": "\\b(import|as|var|let|const|return|break|continue|if|for|in|new|true|false|null|else|try|catch|finally|async|while|exit|and|or|throw|from|join|left|group|by|having|where|on|limit|offset|instanceof)\\b"
         }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        { "name": "keyword.operator.logical.magic-script", "match": "\\|\\||&&|!" },
+        { "name": "keyword.operator.comparison.magic-script", "match": "===|!==|==|!=|<=|>=|<|>" },
+        { "name": "keyword.operator.assignment.magic-script", "match": "=|\\+=|-=|\\*=|/=|%=|<<=|>>=|>>>?=|\\^=|&=|\\|=" },
+        { "name": "keyword.operator.bitwise.magic-script", "match": "<<|>>>|>>|\\^|~|&|\\|" },
+        { "name": "keyword.operator.other.magic-script", "match": "\\?\\.|::|\\.\\.\\.|=>|->|\\?" }
       ]
     },
     "importAlias": {
@@ -101,7 +140,23 @@
             { "name": "keyword.control.magic-script", "match": "\\bimport\\b" },
             { "name": "keyword.control.magic-script", "match": "\\bas\\b" },
             { "name": "string.quoted.single.magic-script", "begin": "'", "end": "'" },
+            { "name": "string.quoted.double.magic-script", "begin": "\"", "end": "\"" },
             { "name": "entity.name.variable.magic-script", "match": "[A-Za-z_][A-Za-z0-9_]*" }
+          ]
+        }
+      ]
+    },
+    "languageBlock": {
+      "patterns": [
+        {
+          "name": "meta.embedded.block.magic-script",
+          "begin": "```([A-Za-z_][A-Za-z0-9_]*)",
+          "beginCaptures": {
+            "1": { "name": "entity.name.language.magic-script" }
+          },
+          "end": "```",
+          "patterns": [
+            { "name": "string.unquoted.block.magic-script", "match": ".+" }
           ]
         }
       ]

@@ -121,6 +121,7 @@
       {
         "type": "magic-api",
         "label": "Magic API Debug",
+        "languages": ["magic-script"],
         "configurationAttributes": {
           "launch": {
             "properties": {
@@ -135,8 +136,7 @@
               },
               "port": {
                 "type": "number",
-                "description": "调试服务器端口",
-                "default": 8081
+                "description": "调试服务器端口（可选，留空使用服务器端口）"
               },
               "stopOnEntry": {
                 "type": "boolean",
@@ -164,7 +164,6 @@
             "request": "launch",
             "name": "调试 Magic API (自定义)",
             "host": "localhost",
-            "port": 8081,
             "stopOnEntry": true,
             "trace": false
           }
@@ -241,13 +240,41 @@
         "icon": "$(new-folder)"
       },
       {
-        "command": "magicApi.testApi",
-        "title": "测试 API",
+        "command": "magicApi.runScript",
+        "title": "运行脚本",
         "category": "Magic API",
         "icon": "$(play)"
+      },
+      {
+        "command": "magicApi.debugScript",
+        "title": "调试脚本",
+        "category": "Magic API",
+        "icon": "$(debug-alt-small)"
       }
     ],
     "menus": {
+      "editor/title": [
+        {
+          "command": "magicApi.runScript",
+          "when": "resourceScheme == magic-api && resourceExtname == .ms",
+          "group": "navigation@1"
+        },
+        {
+          "command": "magicApi.runScript",
+          "when": "resourceScheme == magic-api && resourceExtname == .magic",
+          "group": "navigation@1"
+        },
+        {
+          "command": "magicApi.debugScript",
+          "when": "resourceScheme == magic-api && resourceExtname == .ms",
+          "group": "navigation@2"
+        },
+        {
+          "command": "magicApi.debugScript",
+          "when": "resourceScheme == magic-api && resourceExtname == .magic",
+          "group": "navigation@2"
+        }
+      ],
       "explorer/context": [
         {
           "command": "magicApi.createFile",
@@ -258,13 +285,6 @@
           "command": "magicApi.createGroup",
           "when": "resourceScheme == magic-api",
           "group": "navigation@2"
-        }
-      ],
-      "editor/context": [
-        {
-          "command": "magicApi.testApi",
-          "when": "resourceScheme == magic-api && resourceExtname == .ms",
-          "group": "navigation@1"
         }
       ],
       "commandPalette": [
@@ -281,7 +301,11 @@
   },
   "activationEvents": [
     "onLanguage:magic-script",
-    "onFileSystem:magic-api"
+    "onFileSystem:magic-api",
+    "onDebugResolve:magic-api",
+    "onDebugInitialConfigurations:magic-api",
+    "onCommand:magicApi.debugScript",
+    "onCommand:magicApi.runScript"
   ],
   "scripts": {
     "vscode:prepublish": "npm run compile",

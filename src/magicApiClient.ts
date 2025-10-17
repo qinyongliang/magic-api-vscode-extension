@@ -300,7 +300,70 @@ export class MagicApiClient {
             const urlPath = `${this.webPrefix}/resource/file/${fileId}`;
             debug(`GetFile: baseURL=${this.config.url} path=${urlPath}`);
             const response = await this.httpClient.get(urlPath);
-            return response.data.data || null;
+            const raw = response?.data?.data ?? response?.data ?? null;
+            if (!raw) return null;
+
+            // 基础字段拷贝（容错：后端可能字段不全）
+            const info: MagicFileInfo = {
+                id: String(raw.id ?? fileId),
+                name: String(raw.name ?? ''),
+                path: String(raw.path ?? ''),
+                script: String(raw.script ?? ''),
+                groupId: String(raw.groupId ?? ''),
+                groupPath: String(raw.groupPath ?? ''),
+                type: (raw.type as MagicResourceType) ?? (undefined as any),
+                createTime: raw.createTime,
+                updateTime: raw.updateTime,
+                createBy: raw.createBy,
+                updateBy: raw.updateBy,
+                method: raw.method,
+                requestMapping: raw.requestMapping,
+                description: raw.description,
+                locked: raw.locked,
+                // 类型专属字段（API）
+                params: raw.params ?? raw.parameters,
+                headers: raw.headers,
+                contentType: raw.contentType,
+                timeout: typeof raw.timeout === 'number' ? raw.timeout
+                    : (typeof raw.timeoutMs === 'number' ? raw.timeoutMs : undefined),
+                // 类型专属字段（任务）
+                cron: raw.cron ?? raw.cronExpression,
+                enabled: (typeof raw.enabled !== 'undefined') ? !!raw.enabled
+                    : ((typeof raw.enable !== 'undefined') ? !!raw.enable : undefined),
+                executeOnStart: (typeof raw.executeOnStart !== 'undefined') ? !!raw.executeOnStart
+                    : ((typeof raw.runOnStart !== 'undefined') ? !!raw.runOnStart : undefined),
+                // 完整保留服务端原始扩展字段
+                extra: raw,
+            };
+
+            // 通过缓存的 id->path 映射补全 groupPath/type/name
+            let cachedPath = this.getPathById(info.id);
+            if (!cachedPath && info.groupId) {
+                // 当没有缓存但有 groupId 时，尝试通过资源树补全缓存
+                try {
+                    const group = await this.getGroup(info.groupId);
+                    if (group) {
+                        const guess = `${group.path}/${info.name}.ms`;
+                        cachedPath = guess;
+                        this.idToPathCache.set(info.id, guess);
+                        this.pathToIdCache.set(guess, info.id);
+                    }
+                } catch (e) {
+                    // 忽略补全失败，保留现有字段
+                }
+            }
+
+            if (cachedPath) {
+                const parts = cachedPath.split('/').filter(Boolean);
+                const type = parts[0] as MagicResourceType;
+                const groupPath = parts.slice(0, -1).join('/');
+                const name = parts[parts.length - 1].replace(/\.ms$/, '');
+                info.type = info.type ?? type;
+                info.groupPath = info.groupPath || groupPath;
+                info.name = info.name || name;
+            }
+
+            return info;
         } catch (error) {
             logError(`获取文件信息失败: ${String(error)}`);
             return null;
@@ -325,8 +388,18 @@ export class MagicApiClient {
                 entity.path = file.path || '';
                 entity.method = (file.method || 'GET').toUpperCase();
                 if (file.requestMapping) entity.requestMapping = file.requestMapping;
+                // 类型专属字段（API）
+                if (typeof file.params !== 'undefined') entity.params = file.params;
+                if (typeof file.headers !== 'undefined') entity.headers = file.headers;
+                if (typeof file.contentType !== 'undefined') entity.contentType = file.contentType;
+                if (typeof file.timeout !== 'undefined') entity.timeout = file.timeout;
             } else if (type === 'function') {
                 entity.path = file.path || '';
+            } else if (type === 'task') {
+                // 类型专属字段（任务）
+                if (typeof file.cron !== 'undefined') entity.cron = file.cron;
+                if (typeof file.enabled !== 'undefined') entity.enabled = !!file.enabled;
+                if (typeof file.executeOnStart !== 'undefined') entity.executeOnStart = !!file.executeOnStart;
             }
             const combined = JSON.stringify(entity) + "\r\n================================\r\n" + (file.script || '');
             const payload = this.encrypt(combined);
@@ -364,8 +437,18 @@ export class MagicApiClient {
                 entity.path = request.requestMapping || request.name;
                 entity.method = (request.method || 'GET').toUpperCase();
                 if (request.requestMapping) entity.requestMapping = request.requestMapping;
+                // 类型专属字段（API）
+                if ((request as any).params !== undefined) entity.params = (request as any).params;
+                if ((request as any).headers !== undefined) entity.headers = (request as any).headers;
+                if ((request as any).contentType !== undefined) entity.contentType = (request as any).contentType;
+                if ((request as any).timeout !== undefined) entity.timeout = (request as any).timeout;
             } else if (type === 'function') {
                 entity.path = request.requestMapping || request.name;
+            } else if (type === 'task') {
+                // 类型专属字段（任务）
+                if ((request as any).cron !== undefined) entity.cron = (request as any).cron;
+                if ((request as any).enabled !== undefined) entity.enabled = !!(request as any).enabled;
+                if ((request as any).executeOnStart !== undefined) entity.executeOnStart = !!(request as any).executeOnStart;
             }
             const combined = JSON.stringify(entity) + "\r\n================================\r\n" + (request.script || '');
             const payload = this.encrypt(combined);
@@ -445,7 +528,8 @@ export class MagicApiClient {
 
     // 根据路径获取文件ID
     getFileIdByPath(path: string): string | undefined {
-        return this.pathToIdCache.get(path);
+        const key = String(path || '').replace(/^\/+/, '');
+        return this.pathToIdCache.get(key);
     }
 
     // 根据路径获取分组ID
@@ -602,8 +686,9 @@ export class MagicApiClient {
     getDebugServerUrl(): string {
         const base = new URL(this.config.url);
         const wsProto = base.protocol === 'https:' ? 'wss' : 'ws';
-        // 端口优先使用 debugPort，其次使用 URL 中的端口，最后回退到 8082
-        const port = this.config.debugPort ?? (base.port ? Number(base.port) : 8082);
+        // 端口优先使用 debugPort，其次使用 URL 中的端口，最后回退到协议默认端口（http:80 / https:443）
+        const defaultPort = base.protocol === 'https:' ? 443 : 80;
+        const port = this.config.debugPort ?? (base.port ? Number(base.port) : defaultPort);
         const hostPort = `${base.hostname}:${port}`;
         // 路径前缀合并逻辑同上
         const basePath = (base.pathname || '').replace(/\/$/, '');
@@ -722,5 +807,26 @@ export class MagicApiClient {
     private encrypt(input: string): string {
         const base64 = Buffer.from(input, 'utf8').toString('base64');
         return this.rot13(base64);
+    }
+    
+    // 获取本地提示补全所需的工作台数据（classes/extensions/functions）
+    async getWorkbenchCompletionData(): Promise<any | null> {
+        try {
+            // 将可配置的 webPrefix 转换为 workbench 前缀
+            const workbenchPrefix = this.webPrefix.replace(/\/web(\b|$)/, '/workbench');
+            const url = `${workbenchPrefix}/classes`;
+            debug(`Workbench classes: baseURL=${this.config.url} path=${url}`);
+            // 优先 POST（兼容服务端常见实现），失败则回退到 GET
+            try {
+                const resp = await this.httpClient.post(url);
+                return resp?.data?.data ?? resp?.data ?? null;
+            } catch (e1) {
+                const resp2 = await this.httpClient.get(url);
+                return resp2?.data?.data ?? resp2?.data ?? null;
+            }
+        } catch (err) {
+            debug(`获取工作台数据失败: ${String(err)}`);
+            return null;
+        }
     }
 }
