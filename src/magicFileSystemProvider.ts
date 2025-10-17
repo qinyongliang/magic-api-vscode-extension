@@ -121,9 +121,13 @@ export class MagicFileSystemProvider implements vscode.FileSystemProvider {
             const filePath = `${p.dir}/${p.fileName}.ms`;
             let fid = this.client.getFileIdByPath(filePath);
             if (!fid) {
-                // 填充缓存
+                // 填充缓存（按目录刷新）
                 await this.client.getResourceFiles(p.dir);
                 fid = this.client.getFileIdByPath(filePath);
+            }
+            if (!fid) {
+                // 兜底：全树路径匹配解析
+                fid = await this.client.resolveFileIdByPath(filePath);
             }
             if (!fid) throw vscode.FileSystemError.FileNotFound(uri);
             const fileInfo = await this.client.getFile(fid);
@@ -213,6 +217,9 @@ export class MagicFileSystemProvider implements vscode.FileSystemProvider {
         if (!fid) {
             await this.client.getResourceFiles(p.dir);
             fid = this.client.getFileIdByPath(filePath);
+        }
+        if (!fid) {
+            fid = await this.client.resolveFileIdByPath(filePath);
         }
         if (!fid) {
             throw vscode.FileSystemError.FileNotFound(uri);

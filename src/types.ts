@@ -1,4 +1,10 @@
-export const MAGIC_RESOURCE_TYPES = ['api', 'function', 'datasource', 'task'] as const;
+export const MAGIC_RESOURCE_TYPES = [
+  'api',
+  'function',
+  'datasource',
+  'database',
+  'task',
+] as const;
 export type MagicResourceType = typeof MAGIC_RESOURCE_TYPES[number];
 
 export function isMagicResourceType(value: string): value is MagicResourceType {

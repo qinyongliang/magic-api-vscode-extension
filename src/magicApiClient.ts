@@ -171,7 +171,7 @@ export class MagicApiClient {
         while (queue.length) {
             const cur = queue.shift();
             const n = cur.node || {};
-            const isGroup = n && (typeof n.parentId !== 'undefined' || typeof n.type !== 'undefined');
+            const isGroup = n && typeof n.groupId === 'undefined';
             if (isGroup) {
                 const id = String(n.id || '');
                 const name = String(n.name || '');
@@ -238,14 +238,16 @@ export class MagicApiClient {
         const children: any[] = target.children || [];
         for (const child of children) {
             const n = child.node || {};
-            const isFile = n && typeof n.script === 'string';
+            const isFile = n && typeof n.groupId !== 'undefined';
             if (isFile) {
+                const groupPathName = this.buildPathFromNode(root, String(n.groupId || ''));
+                const groupPath = groupPathName ? `${type}/${groupPathName}` : `${type}`;
                 const info: MagicFileInfo = {
                     id: String(n.id || ''),
                     name: String(n.name || ''),
-                    type: type,
+                    type: type as MagicResourceType,
                     groupId: String(n.groupId || ''),
-                    groupPath: `${type}/${this.buildPathFromNode(root, String(n.groupId || ''))}`,
+                    groupPath,
                     path: String(n.path || ''),
                     requestMapping: String(n.requestMapping || ''),
                     method: String(n.method || ''),
@@ -253,7 +255,11 @@ export class MagicApiClient {
                     script: String(n.script || ''),
                 };
                 files.push(info);
-                if (info.id) this.idToPathCache.set(info.id, `${info.groupPath}/${info.name}.ms`);
+                if (info.id) {
+                    const fileKey = `${groupPath}/${info.name}.ms`;
+                    this.idToPathCache.set(info.id, fileKey);
+                    this.pathToIdCache.set(fileKey, info.id);
+                }
             }
         }
         return files;
@@ -261,35 +267,79 @@ export class MagicApiClient {
 
     async getFile(fileId: string): Promise<MagicFileInfo | null> {
         await this.ensureLogin();
-        const resp = await this.httpClient.post('/resource');
-        const tree = resp?.data?.data || {};
-        const typeKeys = Object.keys(tree);
-        for (const type of typeKeys) {
-            const root = tree[type];
-            const queue: any[] = [root];
-            while (queue.length) {
-                const cur = queue.shift();
-                const n = cur.node || {};
-                if (n && String(n.id || '') === String(fileId || '')) {
-                    const info: MagicFileInfo = {
-                        id: String(n.id || ''),
-                        name: String(n.name || ''),
-                        type: (n.type || type) as MagicResourceType,
-                        groupId: String(n.groupId || ''),
-                        groupPath: `${type}/${this.buildPathFromNode(root, String(n.groupId || ''))}`,
-                        path: String(n.path || ''),
-                        requestMapping: String(n.requestMapping || ''),
-                        method: String(n.method || ''),
-                        description: String(n.description || ''),
-                        script: String(n.script || ''),
-                    };
-                    return info;
+        const resp = await this.httpClient.get(`/resource/file/${fileId}`, { headers: this.getAuthHeaders() });
+        const data = resp?.data?.data || resp?.data;
+        if (!data) return null;
+
+        const id = String((data as any)?.id || fileId);
+        const name = String((data as any)?.name || '');
+        const script = String((data as any)?.script || '');
+        const groupId = String((data as any)?.groupId || '');
+        const type = (this.inferTypeFromId(id) || 'api') as MagicResourceType;
+
+        // 计算 groupPath 与缓存 fileKey
+        let fileKey = this.idToPathCache.get(id);
+        let groupPath = '';
+        if (fileKey) {
+            const segs = fileKey.split('/').filter(Boolean);
+            groupPath = segs.slice(0, -1).join('/');
+        } else {
+            try {
+                const r = await this.httpClient.post('/resource');
+                const tree = r?.data?.data || {};
+                const root = tree[type];
+                if (root && groupId) {
+                    const gpName = this.buildPathFromNode(root, groupId);
+                    groupPath = gpName ? `${type}/${gpName}` : `${type}`;
+                } else if (root) {
+                    const queue: any[] = [root];
+                    while (queue.length) {
+                        const cur = queue.shift();
+                        const n = cur.node || {};
+                        if (n && String(n.id || '') === id) {
+                            const gpName = this.buildPathFromNode(root, String(n.groupId || ''));
+                            groupPath = gpName ? `${type}/${gpName}` : `${type}`;
+                            break;
+                        }
+                        const children: any[] = cur.children || [];
+                        for (const child of children) queue.push(child);
+                    }
                 }
-                const children: any[] = cur.children || [];
-                for (const child of children) queue.push(child);
+                if (!groupPath) groupPath = `${type}`;
+            } catch {
+                groupPath = `${type}`;
             }
+            fileKey = `${groupPath}/${name}.ms`;
+            if (id) this.idToPathCache.set(id, fileKey);
+            if (fileKey) this.pathToIdCache.set(fileKey, id);
         }
-        return null;
+
+        const info: MagicFileInfo = {
+            id,
+            name,
+            type,
+            groupId,
+            groupPath,
+            path: String((data as any)?.path || ''),
+            requestMapping: String((data as any)?.requestMapping || ''),
+            method: String((data as any)?.method || ''),
+            description: String((data as any)?.description || ''),
+            script,
+            createTime: (data as any)?.createTime,
+            updateTime: (data as any)?.updateTime,
+            createBy: (data as any)?.createBy,
+            updateBy: (data as any)?.updateBy,
+            params: (data as any)?.params,
+            headers: (data as any)?.headers,
+            contentType: (data as any)?.contentType,
+            timeout: (data as any)?.timeout,
+            cron: (data as any)?.cron,
+            enabled: (data as any)?.enabled,
+            executeOnStart: (data as any)?.executeOnStart,
+            extra: (data as any)?.properties,
+        };
+        return info;
+
     }
 
     async saveFile(file: MagicFileInfo): Promise<boolean> {
@@ -342,6 +392,50 @@ export class MagicApiClient {
         return this.idToPathCache.get(id);
     }
 
+    // 兜底：通过遍历资源树按路径解析文件ID，并填充缓存
+    async resolveFileIdByPath(fileKey: string): Promise<string | undefined> {
+        try {
+            await this.ensureLogin();
+            // 规范化输入路径（去除前导斜杠）
+            const key = String(fileKey || '').replace(/^\/+/, '');
+            const segs = key.split('/').filter(Boolean);
+            if (segs.length < 2) return undefined;
+            const type = segs[0] as MagicResourceType;
+            const fileNameWithExt = segs[segs.length - 1];
+            const fileName = fileNameWithExt.replace(/\.ms$/i, '');
+            const groupSegs = segs.slice(1, -1);
+
+            const resp = await this.httpClient.post('/resource');
+            const tree = resp?.data?.data || {};
+            const root = tree[type];
+            if (!root) return undefined;
+
+            const queue: any[] = [root];
+            while (queue.length) {
+                const cur = queue.shift();
+                const n = cur.node || {};
+                const isFile = n && typeof n.groupId !== 'undefined';
+                if (isFile) {
+                    const gp = this.buildPathFromNode(root, String(n.groupId || ''));
+                    const full = `${type}/${gp}/${String(n.name || '')}.ms`;
+                    if (full === key) {
+                        const id = String(n.id || '');
+                        if (id) {
+                            this.idToPathCache.set(id, full);
+                            this.pathToIdCache.set(full, id);
+                            return id;
+                        }
+                    }
+                }
+                const children: any[] = cur.children || [];
+                for (const child of children) queue.push(child);
+            }
+            return undefined;
+        } catch {
+            return undefined;
+        }
+    }
+
     private buildGroupPath(group: MagicGroupInfo, allGroups: MagicGroupInfo[]): string {
         const path: string[] = [group.name];
         let parentId = group.parentId;
@@ -380,14 +474,16 @@ export class MagicApiClient {
         const children: any[] = target.children || [];
         for (const child of children) {
             const n = child.node || {};
-            const isFile = n && typeof n.script === 'string';
+            const isFile = n && typeof n.groupId !== 'undefined';
             if (isFile) {
+                const groupPathName = this.buildPathFromNode(root, String(n.groupId || ''));
+                const groupPath = groupPathName ? `${type}/${groupPathName}` : `${type}`;
                 const info: MagicFileInfo = {
                     id: String(n.id || ''),
                     name: String(n.name || ''),
                     type: type as MagicResourceType,
                     groupId: String(n.groupId || ''),
-                    groupPath: `${type}/${this.buildPathFromNode(root, String(n.groupId || ''))}`,
+                    groupPath,
                     path: String(n.path || ''),
                     requestMapping: String(n.requestMapping || ''),
                     method: String(n.method || ''),
@@ -395,7 +491,11 @@ export class MagicApiClient {
                     script: String(n.script || ''),
                 };
                 files.push(info);
-                if (info.id) this.idToPathCache.set(info.id, `${info.groupPath}/${info.name}.ms`);
+                if (info.id) {
+                    const fileKey = `${groupPath}/${info.name}.ms`;
+                    this.idToPathCache.set(info.id, fileKey);
+                    this.pathToIdCache.set(fileKey, info.id);
+                }
             }
         }
         return files;
@@ -468,7 +568,7 @@ export class MagicApiClient {
         const children: any[] = node?.children || [];
         for (const child of children) {
             const n = child.node || {};
-            const isGroup = n && (typeof n.parentId !== 'undefined' || typeof n.type !== 'undefined');
+            const isGroup = n && typeof n.groupId === 'undefined';
             if (isGroup) {
                 const seg = n.name;
                 const newSegs = pathSegs.concat([seg]);
@@ -489,7 +589,7 @@ export class MagicApiClient {
         for (const seg of segs) {
             const next = (current.children || []).find((c: any) => {
                 const n = c.node || {};
-                const isGroup = n && (typeof n.parentId !== 'undefined' || typeof n.type !== 'undefined');
+                const isGroup = n && typeof n.groupId === 'undefined';
                 return isGroup && n.name === seg;
             });
             if (!next) return null;
@@ -505,7 +605,7 @@ export class MagicApiClient {
         while (queue.length) {
             const cur = queue.shift();
             const n = cur.node || {};
-            const isGroup = n && (typeof n.parentId !== 'undefined' || typeof n.type !== 'undefined');
+            const isGroup = n && typeof n.groupId === 'undefined';
             if (isGroup && n.id === id) return cur;
             const children: any[] = cur.children || [];
             for (const child of children) queue.push(child);
@@ -543,7 +643,7 @@ export class MagicApiClient {
         const nameSegs: string[] = [];
         while (cur && cur !== root) {
             const n = cur.node || {};
-            const isGroup = n && (typeof n.parentId !== 'undefined' || typeof n.type !== 'undefined');
+            const isGroup = n && typeof n.groupId === 'undefined';
             if (isGroup) nameSegs.unshift(String(n.name || ''));
             cur = parentMap.get(cur);
         }
