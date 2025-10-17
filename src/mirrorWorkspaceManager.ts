@@ -1319,13 +1319,17 @@ export class MirrorWorkspaceManager {
                 // 优先刷新一次工作台补全数据，供本地提示在 LSP 不可用时使用
                 try { await this.refreshWorkbenchCompletionData(client, mirrorRoot, progress); } catch {}
                 const dirs = await client.getResourceDirs();
+                // 加入顶层类型目录，确保无分组时也能扫描到根级文件
+                const scanDirSet = new Set<string>(dirs);
+                for (const t of MAGIC_RESOURCE_TYPES) scanDirSet.add(t);
+                const scanDirs = Array.from(scanDirSet);
                 if (token.isCancellationRequested) { cancelled = true; return; }
 
                 const remotePaths = new Set<string>();
                 const remoteUpdateMap = new Map<string, number>();
 
                 // 扫描服务器文件
-                for (const dir of dirs) {
+                for (const dir of scanDirs) {
                     if (token.isCancellationRequested) { cancelled = true; return; }
                     const files = await client.getResourceFiles(dir);
                     for (const f of files) {
@@ -1434,10 +1438,14 @@ export class MirrorWorkspaceManager {
 
         // 拉取服务器目录与文件信息
         const dirs = await client.getResourceDirs();
+        // 加入顶层类型目录，确保无分组时也能扫描到根级文件
+        const scanDirSet = new Set<string>(dirs);
+        for (const t of MAGIC_RESOURCE_TYPES) scanDirSet.add(t);
+        const scanDirs = Array.from(scanDirSet);
         // 记录本地已扫描的文件键，之后补充本地独有文件
         const seenLocalKeys = new Set<string>();
 
-        for (const dir of dirs) {
+        for (const dir of scanDirs) {
             const segs = dir.split('/').filter(Boolean);
             const type = segs[0] as MagicResourceType;
             const groupPathSub = segs.slice(1).join('/');

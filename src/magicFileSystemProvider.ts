@@ -149,10 +149,11 @@ export class MagicFileSystemProvider implements vscode.FileSystemProvider {
         const p = this.parsePath(uri);
         const entries: [string, vscode.FileType][] = [];
 
-        const dirs = await this.client.getResourceDirs();
+        const dirs = this.client ? await this.client.getResourceDirs() : [];
         if (p.isRoot) {
-            // 展示顶层目录：严格使用服务返回的第一段
+            // 展示顶层目录：加入服务返回的第一段，并始终包含类型根
             const topSet = new Set<string>();
+            for (const t of MAGIC_RESOURCE_TYPES) topSet.add(t);
             for (const d of dirs) {
                 const seg = d.split('/')[0];
                 if (seg) topSet.add(seg);
@@ -163,7 +164,7 @@ export class MagicFileSystemProvider implements vscode.FileSystemProvider {
             return entries;
         }
 
-        // 子目录：展示 p.dir 的子目录与文件
+        // 子目录：展示 p.dir 的子目录与文件（无客户端时返回空）
         const childDirSet = new Set<string>();
         const prefix = p.dir + '/';
         for (const d of dirs) {
@@ -175,7 +176,7 @@ export class MagicFileSystemProvider implements vscode.FileSystemProvider {
         }
         for (const name of Array.from(childDirSet)) entries.push([name, vscode.FileType.Directory]);
 
-        const files = await this.client.getResourceFiles(p.dir);
+        const files = this.client ? await this.client.getResourceFiles(p.dir) : [];
         for (const f of files) entries.push([`${f.name}.ms`, vscode.FileType.File]);
         return entries;
     }

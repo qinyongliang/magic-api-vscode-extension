@@ -79,12 +79,40 @@ export class MagicApiClient {
             }
             return cfg;
         });
-        this.httpClient.interceptors.response.use((resp: any) => resp, (err: any) => {
-            if (err?.response?.status === 401) {
-                this.sessionToken = undefined;
-            }
-            throw err;
-        });
+
+        // 响应拦截器：同时在成功分支与错误分支处理鉴权失效（code=401 或消息提示）并自动登录重试
+        this.httpClient.interceptors.response.use(
+            async (response: any) => {
+                try {
+                    const body =  response?.data;
+                    const code = typeof body?.code !== 'undefined' ? body.code : undefined;
+                    const message = body?.message || '';
+                    const path = response?.config?.url;
+                    const isTokenInvalid = code === 401 || /token无效/i.test(String(message));
+                    if (isTokenInvalid && response?.config && !response.config._retry) {
+                        response.config._retry = true;
+                        debug(`HTTP 200 但业务码为401/token无效: url=${path ?? 'n/a'}，尝试自动登录并重试`);
+                        const token = await this.ensureLogin();
+                        if (token) {
+                            response.config.headers = response.config.headers || {};
+                            response.config.headers[this.exposeHeaders] = token;
+                            try {
+                                return await this.httpClient.request(response.config);
+                            } catch (retryErr: any) {
+                                const rStatus = retryErr?.response?.status;
+                                debug(`重试失败: status=${rStatus ?? 'n/a'} url=${path ?? 'n/a'} message=${retryErr?.message}`);
+                                vscode.window.showErrorMessage(`请求重试失败: ${retryErr?.message}`);
+                                return Promise.reject(retryErr);
+                            }
+                        }
+                    }
+                } catch (e) {
+                    // 安全兜底：若解析失败则直接返回原响应
+                }
+                return response;
+            },
+            (error: any) => error
+        )
     }
 
     getAuthHeaders(): Record<string, string> {
@@ -100,22 +128,40 @@ export class MagicApiClient {
         this.loginInFlight = undefined;
         return tok;
     }
-
+    
+    // 使用用户名密码自动登录并获取令牌（兼容多种返回结构与路径）
     private async login(): Promise<string | null> {
-        try {
-            const { username, password } = this.config;
-            if (!username || !password) return null;
-            const resp = await this.httpClient.post('/login', { username, password });
-            const tok = resp?.data?.data?.token || resp?.data?.token || resp?.headers?.[this.exposeHeaders];
-            if (tok) this.sessionToken = tok;
-            return tok || null;
-        } catch (e) {
-            logError(`Login failed: ${String(e)}`);
+        const { username, password } = this.config;
+        if (!username || !password) {
+            debug('未配置用户名/密码，无法自动登录获取令牌');
             return null;
         }
+        try {
+            const axiosClient = axios.create({
+                baseURL: this.httpClient.getUri(),
+                timeout: 3000,
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                },
+            });
+            const resp = await axiosClient.post(`${this.webPrefix}/login`, `username=${username}&password=${password}`);
+            this.exposeHeaders = (resp.headers['access-control-expose-headers'] || '').toLowerCase();
+            const token = resp.headers[this.exposeHeaders] 
+            if (typeof token === 'string' && token.length > 0) {
+                this.sessionToken = token;
+                this.httpClient.defaults.headers.common[this.exposeHeaders] = token;
+                debug(`登录成功，令牌已更新并附加到请求头: ${this.exposeHeaders}`);
+                return token;
+            }
+        } catch (e: any) {
+            debug(`登录失败 : ${String(e?.message || e)}`);
+        }
+        vscode.window.showErrorMessage('自动登录失败：未能获取令牌');
+        return null;
     }
 
     async getGroups(type: MagicResourceType): Promise<MagicGroupInfo[]> {
+        await this.ensureLogin();
         const resp = await this.httpClient.post('/resource');
         const tree = resp?.data?.data || {};
         const root = tree[type];
@@ -150,6 +196,7 @@ export class MagicApiClient {
     }
 
     async getGroup(groupId: string): Promise<MagicGroupInfo | null> {
+        await this.ensureLogin();
         const resp = await this.httpClient.post('/resource');
         const tree = resp?.data?.data || {};
         const typeKeys = Object.keys(tree);
@@ -175,6 +222,7 @@ export class MagicApiClient {
     }
 
     async getFiles(type: MagicResourceType, groupId: string | null): Promise<MagicFileInfo[]> {
+        await this.ensureLogin();
         const resp = await this.httpClient.post('/resource');
         const tree = resp?.data?.data || {};
         const root = tree[type];
@@ -212,6 +260,7 @@ export class MagicApiClient {
     }
 
     async getFile(fileId: string): Promise<MagicFileInfo | null> {
+        await this.ensureLogin();
         const resp = await this.httpClient.post('/resource');
         const tree = resp?.data?.data || {};
         const typeKeys = Object.keys(tree);
@@ -306,6 +355,7 @@ export class MagicApiClient {
     }
 
     async getResourceDirs(): Promise<string[]> {
+        await this.ensureLogin();
         const resp = await this.httpClient.post('/resource');
         const tree = resp?.data?.data || {};
         const dirs: string[] = [];
@@ -317,6 +367,7 @@ export class MagicApiClient {
     }
 
     async getResourceFiles(dir: string): Promise<MagicFileInfo[]> {
+        await this.ensureLogin();
         const resp = await this.httpClient.post('/resource');
         const tree = resp?.data?.data || {};
         const segs = dir.split('/').filter(Boolean);
@@ -353,6 +404,7 @@ export class MagicApiClient {
     // 新增：根据目录获取分组原始元数据（用于写入 .group.meta.json）
     async getGroupMetaByDir(dir: string): Promise<MagicGroupMetaRaw | null> {
         try {
+            await this.ensureLogin();
             const resp = await this.httpClient.post('/resource');
             const tree = resp?.data?.data || {};
             const segs = dir.split('/').filter(Boolean);
@@ -521,6 +573,7 @@ export class MagicApiClient {
 
     async getWorkbenchCompletionData(): Promise<any | null> {
         try {
+            await this.ensureLogin();
             const resp = await this.httpClient.post('/workbench');
             const data = resp?.data?.data || null;
             return data;
@@ -531,6 +584,7 @@ export class MagicApiClient {
 
     async searchWorkbench(keyword: string): Promise<Array<{ id: string; text: string; line: number }>> {
         try {
+            await this.ensureLogin();
             const resp = await this.httpClient.post('/workbench/search', { keyword });
             const data = resp?.data?.data || [];
             return data;

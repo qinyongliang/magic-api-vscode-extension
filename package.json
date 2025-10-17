@@ -48,7 +48,6 @@
         "path": "./syntaxes/magic-script.tmLanguage.json"
       }
     ],
-
     "configuration": {
       "type": "object",
       "title": "Magic API",
@@ -121,7 +120,9 @@
       {
         "type": "magic-api",
         "label": "Magic API Debug",
-        "languages": ["magic-script"],
+        "languages": [
+          "magic-script"
+        ],
         "configurationAttributes": {
           "launch": {
             "properties": {
@@ -216,6 +217,18 @@
         "icon": "$(plug)"
       },
       {
+        "command": "magicApi.connectMirrorRoot",
+        "title": "连接镜像工作区",
+        "category": "Magic API",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "magicApi.disconnectMirrorRoot",
+        "title": "断开镜像工作区",
+        "category": "Magic API",
+        "icon": "$(debug-disconnect)"
+      },
+      {
         "command": "magicApi.restartLanguageServer",
         "title": "重启语言服务器",
         "category": "Magic API",
@@ -285,6 +298,16 @@
           "command": "magicApi.createGroup",
           "when": "resourceScheme == magic-api",
           "group": "navigation@2"
+        },
+        {
+          "command": "magicApi.connectMirrorRoot",
+          "when": "resourceFilename == .magic-api-mirror.json",
+          "group": "navigation@3"
+        },
+        {
+          "command": "magicApi.disconnectMirrorRoot",
+          "when": "resourceFilename == .magic-api-mirror.json",
+          "group": "navigation@4"
         }
       ],
       "commandPalette": [
@@ -305,7 +328,10 @@
     "onDebugResolve:magic-api",
     "onDebugInitialConfigurations:magic-api",
     "onCommand:magicApi.debugScript",
-    "onCommand:magicApi.runScript"
+    "onCommand:magicApi.runScript",
+    "onCommand:magicApi.connectWorkspace",
+    "onCommand:magicApi.connectMirrorRoot",
+    "onCommand:magicApi.disconnectMirrorRoot"
   ],
   "scripts": {
     "vscode:prepublish": "npm run compile",
@@ -313,18 +339,20 @@
     "watch": "tsc -watch -p ./"
   },
   "devDependencies": {
+    "@types/diff-match-patch": "^1.0.36",
     "@types/node": "16.x",
     "@types/vscode": "^1.74.0",
     "@types/ws": "^8.5.0",
+    "diff-match-patch": "^1.0.5",
     "typescript": "^4.9.4"
   },
   "dependencies": {
     "@types/axios": "^0.9.36",
     "axios": "^1.12.2",
+    "tslib": "^2.6.2",
     "vscode-debugadapter": "^1.51.0",
     "vscode-languageclient": "^8.1.0",
-    "ws": "^8.14.0",
     "vscode-ws-jsonrpc": "^1.0.2",
-    "tslib": "^2.6.2"
+    "ws": "^8.14.0"
   }
 }

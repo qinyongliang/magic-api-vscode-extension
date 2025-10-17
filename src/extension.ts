@@ -84,7 +84,7 @@ class MagicApiDebugConfigurationProvider implements vscode.DebugConfigurationPro
                         const fetched = await client.getFile(fid);
                         if (fetched) infoToUse = fetched as MagicFileInfo;
                     }
-                }
+                } 
             }
 
             if (infoToUse) {
@@ -123,6 +123,16 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
+    // 挂载虚拟根到工作区（若未挂载），便于在资源管理器中浏览
+    try {
+        const magicRoot = vscode.Uri.parse('magic-api:/');
+        const folders = vscode.workspace.workspaceFolders || [];
+        const hasVirtual = folders.some(f => f.uri.scheme === 'magic-api');
+        if (!hasVirtual) {
+            vscode.workspace.updateWorkspaceFolders(0, 0, { uri: magicRoot, name: 'Magic API' });
+        }
+    } catch {}
+
     // 监听服务器变化，更新文件系统提供者
     serverManager.onServerChanged(async (serverId) => {
         const client = serverManager.getCurrentClient();
@@ -135,6 +145,16 @@ export function activate(context: vscode.ExtensionContext) {
                 const cfg = serverId ? serverManager.getServers().find(s => s.id === serverId) : undefined;
                 if (cfg) {
                     await mirrorManager.promptCreateMirrorWorkspaceIfNeeded(client, cfg);
+                }
+            } catch {}
+
+            // 确保虚拟根已挂载（当前工作区首个文件夹为 magic-api 以便提示镜像）
+            try {
+                const magicRoot = vscode.Uri.parse('magic-api:/');
+                const folders = vscode.workspace.workspaceFolders || [];
+                const hasVirtual = folders.some(f => f.uri.scheme === 'magic-api');
+                if (!hasVirtual) {
+                    vscode.workspace.updateWorkspaceFolders(0, 0, { uri: magicRoot, name: 'Magic API' });
                 }
             } catch {}
         }
@@ -432,6 +452,15 @@ function registerCommands(
     const connectWorkspaceCommand = vscode.commands.registerCommand('magicApi.connectWorkspace', async () => {
         const serverId = await serverManager.showServerPicker();
         if (serverId) {
+            // 新增：先询问是否创建镜像工作区
+            const action = await vscode.window.showInformationMessage(
+                '是否创建对应的本地镜像工作区以进行本地维护？',
+                '创建镜像工作区', '稍后'
+            );
+            if (action !== '创建镜像工作区') {
+                return;
+            }
+    
             // 打开本地镜像工作区（选择一个本地目录进行同步）
             const client = serverManager.getCurrentClient();
             if (!client) {
